@@ -1,0 +1,47 @@
+{
+  "designRequired": false,
+  "approvedDesignHash": null,
+  "id": "BOT-06",
+  "status": "specified",
+  "reqHash": "fa69658d36f9af5a2ab0e8084c282e384692254784d9791f257491c0814813c3",
+  "holds": [],
+  "approvedSpecHash": "9c9b380703bd53dfa9547190783e004f029d80330d2ebd22808cebbe8be2cd4c",
+  "bug": null,
+  "decisions": [],
+  "feedback": [],
+  "history": [
+    {
+      "from": null,
+      "to": "cataloged",
+      "transition": "register",
+      "actor": "sync",
+      "at": "2026-11-20T07:06:28.205Z",
+      "message": "요구사항 등록"
+    },
+    {
+      "from": "cataloged",
+      "to": "cataloged",
+      "transition": "reset",
+      "actor": "sync",
+      "at": "2026-11-20T07:16:23.738Z",
+      "message": "요구사항 변경 → 초안과 대기를 폐기"
+    },
+    {
+      "from": "cataloged",
+      "to": "cataloged",
+      "transition": "draftSpec",
+      "actor": "spec",
+      "at": "2026-11-20T07:25:50.459Z",
+      "message": "스펙 초안 제출 → 승인 대기"
+    },
+    {
+      "from": "cataloged",
+      "to": "specified",
+      "transition": "approveSpec",
+      "actor": "human",
+      "at": "2026-11-20T07:27:11.231Z",
+      "message": "스펙 승인"
+    }
+  ],
+  "contentHash": "feceef0d94b17ecf1ae79353735a1200655629feaacae1a28e409bdd22c812e9"
+}

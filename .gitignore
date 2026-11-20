@@ -1,0 +1,7 @@
+/target/
+/data/
+/graft/
+/.fsd/runs/
+.env
+.env.*
+!.env.example

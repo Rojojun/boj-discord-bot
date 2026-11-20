@@ -1,0 +1,39 @@
+{
+  "designRequired": false,
+  "approvedDesignHash": null,
+  "id": "BOT-02",
+  "status": "specified",
+  "reqHash": "e92c0c0a3109c4c2a4e5411984d826e4e0bd34f1ffc749f0d84258ad610185db",
+  "holds": [],
+  "approvedSpecHash": "268cdbfede744bac42e24149bf1fbceda28374e0eb7794b26727d30d7f11cfa4",
+  "bug": null,
+  "decisions": [],
+  "feedback": [],
+  "history": [
+    {
+      "from": null,
+      "to": "cataloged",
+      "transition": "register",
+      "actor": "sync",
+      "at": "2026-11-20T07:06:28.205Z",
+      "message": "요구사항 등록"
+    },
+    {
+      "from": "cataloged",
+      "to": "cataloged",
+      "transition": "draftSpec",
+      "actor": "spec",
+      "at": "2026-11-20T07:09:57.596Z",
+      "message": "스펙 초안 제출 → 승인 대기"
+    },
+    {
+      "from": "cataloged",
+      "to": "specified",
+      "transition": "approveSpec",
+      "actor": "human",
+      "at": "2026-11-20T07:10:25.187Z",
+      "message": "스펙 승인"
+    }
+  ],
+  "contentHash": "1a0eda334cf14ff44207544b1207fcc2e2b787ca8bf3bf767cb6fe6cae3924d8"
+}
