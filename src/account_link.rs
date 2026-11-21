@@ -128,6 +128,20 @@ impl AccountLinks {
         Ok(linked.tokens)
     }
 
+    pub fn account(&self, user: u64) -> Result<Account, LinkError> {
+        let file = File::open(self.path(user)).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                LinkError::ReconnectRequired
+            } else {
+                LinkError::Storage(error)
+            }
+        })?;
+        let linked: LinkedAccount = serde_json::from_reader(file)
+            .map_err(io::Error::other)
+            .map_err(LinkError::Storage)?;
+        Ok(linked.account)
+    }
+
     fn path(&self, user: u64) -> PathBuf {
         self.data
             .join(user.to_string())

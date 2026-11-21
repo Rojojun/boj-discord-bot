@@ -1,13 +1,18 @@
+use boj_discord_bot::{
+    discord_commands::{self, Commands},
+    solved_ac::SolvedAc,
+};
 use serenity::all::{
-    ApplicationId, ChannelId, Client, Context, CreateCommand, CreateInteractionResponse,
-    CreateInteractionResponseMessage, EventHandler, GatewayIntents, GuildId, Interaction, Ready,
+    ApplicationId, ChannelId, Client, Context, EditInteractionResponse, EventHandler,
+    GatewayIntents, GuildId, Interaction, Ready,
 };
 use serenity::async_trait;
-use std::{env, error::Error, io};
+use std::{env, error::Error, io, path::PathBuf, sync::Arc};
 
 struct Handler {
     guild: GuildId,
     channel: ChannelId,
+    commands: Arc<Commands>,
 }
 
 #[async_trait]
@@ -20,19 +25,30 @@ impl EventHandler for Handler {
         let Interaction::Command(command) = interaction else {
             return;
         };
-        if command.guild_id != Some(self.guild)
-            || command.channel_id != self.channel
-            || command.data.name != "ping"
-        {
+        if command.guild_id != Some(self.guild) || command.channel_id != self.channel {
             return;
         }
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content("퐁! 코테-마타-봇이 연결되어 있어요.")
-                .ephemeral(true),
-        );
-        if command.create_response(&ctx.http, response).await.is_err() {
-            eprintln!("/ping 응답 전송 실패. Discord 연결 상태를 확인하세요.");
+        if command.defer_ephemeral(&ctx.http).await.is_err() {
+            eprintln!("명령 접수 실패. Discord 연결 상태를 확인하세요.");
+            return;
+        }
+        let commands = Arc::clone(&self.commands);
+        let name = command.data.name.clone();
+        let options = command.data.options.clone();
+        let user = command.user.id.get();
+        let text = tokio::task::spawn_blocking(move || {
+            commands.execute(user, &name, &options, std::time::SystemTime::now().into())
+        })
+        .await
+        .unwrap_or_else(|_| "명령 처리 중 오류가 발생했습니다. 잠시 후 다시 시도하세요.".into());
+        // Keep responses within Discord's content limit, including API-supplied handles.
+        let text: String = text.chars().take(1950).collect();
+        if command
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(text))
+            .await
+            .is_err()
+        {
+            eprintln!("명령 응답 전송 실패. Discord 연결 상태를 확인하세요.");
         }
     }
 }
@@ -68,19 +84,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let application = ApplicationId::new(required_id("DISCORD_APPLICATION_ID")?);
     let guild = GuildId::new(required_id("DISCORD_GUILD_ID")?);
     let channel = ChannelId::new(required_id("DISCORD_CHANNEL_ID")?);
+    let api = match (
+        required("SOLVED_AC_CLIENT_ID"),
+        required("SOLVED_AC_CLIENT_SECRET"),
+    ) {
+        (Ok(id), Ok(secret)) => Some(SolvedAc::new(id, secret)),
+        (Err(_), Err(_)) => None,
+        _ => {
+            return Err(
+                io::Error::other("solved.ac Client ID와 Client Secret을 모두 설정하세요.").into(),
+            );
+        }
+    };
+    let data = PathBuf::from(env::var("BOT_DATA_DIR").unwrap_or_else(|_| "data".into()));
+    std::fs::create_dir_all(&data)?;
+    let mut commands = Commands::new(&data, api);
+    let redirect = env::var("SOLVED_AC_REDIRECT_URI")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let callback = if let Some(redirect) = redirect {
+        commands = commands.with_redirect(redirect)?;
+        Some(tokio::net::TcpListener::bind("127.0.0.1:8787").await?)
+    } else {
+        None
+    };
+    let commands = Arc::new(commands);
+    if let Some(listener) = callback {
+        let commands = Arc::clone(&commands);
+        tokio::spawn(async move {
+            if boj_discord_bot::oauth_callback::serve(listener, commands)
+                .await
+                .is_err()
+            {
+                eprintln!("OAuth 콜백 서버가 중단되었습니다. 봇을 재시작해주세요.");
+            }
+        });
+        println!("OAuth 콜백 수신 준비: 127.0.0.1:8787/oauth/callback");
+    }
     let mut client = Client::builder(token, GatewayIntents::empty())
         .application_id(application)
-        .event_handler(Handler { guild, channel })
+        .event_handler(Handler {
+            guild,
+            channel,
+            commands,
+        })
         .await?;
 
-    // Upsert just this command, preserving any other commands in the server.
-    guild
-        .create_command(
-            &client.http,
-            CreateCommand::new("ping").description("코테-마타-봇 연결 상태를 확인합니다"),
-        )
-        .await?;
-    println!("테스트 서버에 /ping 등록 완료. 봇을 연결합니다.");
+    // Upsert our commands without deleting unrelated guild commands.
+    for definition in discord_commands::definitions() {
+        guild.create_command(&client.http, definition).await?;
+    }
+    println!("학습 설정 명령 등록 완료. /help로 사용법을 확인하세요.");
 
     let shards = client.shard_manager.clone();
     tokio::spawn(async move {

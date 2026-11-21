@@ -1,7 +1,7 @@
 # Debian 13 x86_64 바이너리 배포
 
 서버에서 최초 빌드 후 systemd가 실행 파일을 직접 실행한다. 실행 중에는 Rust나 Cargo가 필요 없다.
-배포 대상은 현재 구현된 `/ping`이다. 홈서버의 인터넷 연결과 DNS가 필요하며 인바운드 포트는 필요 없다.
+배포 대상은 `/help`, `/setup`, `/settings`, `/skip`, `/resume`, `/curriculum` 등 학습 설정 명령이다. `/setup`의 실제 프로필 조회에는 solved.ac 앱 인증값이 필요하다. 신규 문제 배정은 아직 연결 중이다. 홈서버의 인터넷 연결과 DNS가 필요하며 현재 인바운드 포트는 필요 없다.
 
 ## 1. 소스 전송 및 빌드
 
@@ -41,6 +41,8 @@ sudo nano /etc/boj-discord-bot/bot.env
 ```
 
 `DISCORD_BOT_TOKEN`에 재발급한 토큰을 넣는다. 예시의 서버와 채널 ID가 맞는지 확인한다.
+`/setup`을 사용하려면 `SOLVED_AC_CLIENT_ID`와 `SOLVED_AC_CLIENT_SECRET`도 서버 환경변수 파일에 추가한다. 두 값이 없으면 다른 명령은 실행하고 `/setup`은 설정 안내를 반환한다.
+OAuth 연결에는 `SOLVED_AC_REDIRECT_URI`를 추가한다. 수신 주소는 `127.0.0.1:8787/oauth/callback`이며 HTTPS 프록시를 거쳐 등록 주소에 연결한다. 이 경로의 접근 로그에 쿼리를 기록하지 않는다. 프록시 설정은 호스트 주소에 맞춰 별도로 해야 한다. `/connect` 인증 후 `/account`로 연결을 확인한다.
 실제 토큰은 서버 설정 파일에만 저장하고 소스나 배포 압축에 넣지 않는다.
 로컬에서 실행하던 봇을 Ctrl+C로 종료한 후 서버 서비스를 시작한다.
 

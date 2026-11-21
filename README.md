@@ -6,7 +6,7 @@ solved.ac 티어로 매일 연습 문제를 고르고, 목표별 학습과 풀�
 
 ### Discord 연결 확인
 
-`/ping`에 응답하는 봇 실행 진입점이 있다. 프로젝트 폴더에서 다음과 같이 실행한다.
+Discord 명령과 사용자별 설정 저장을 연결했다. 프로젝트 폴더에서 다음과 같이 실행한다.
 
 1. `.env.example`을 `.env`로 복사한다. `.env`는 Git에서 제외된다.
 2. `DISCORD_BOT_TOKEN`에 Bot Token을, `DISCORD_GUILD_ID`에 초대한 테스트 서버 ID를, `DISCORD_CHANNEL_ID`에 사용할 채널 ID를 넣는다. Application ID와 채널 ID는 예시에 설정되어 있다.
@@ -15,7 +15,13 @@ solved.ac 티어로 매일 연습 문제를 고르고, 목표별 학습과 풀�
 서버 ID는 Discord 설정 → 고급 → 개발자 모드를 켠 뒤 서버 아이콘을 우클릭해 복사한다.
 토큰은 채팅이나 저장소에 올리지 않는다. 별도의 privileged intent 설정은 필요 없다.
 명령은 지정한 서버에만 등록하며 지정한 채널에서만 응답한다. 응답은 명령을 실행한 사용자에게만 보인다. 다른 방의 가시성과 명령 표시 제한은 Discord 채널 권한 및 서버 연동 설정에서 별도로 설정한다. 종료는 Ctrl+C다.
-현재 `/setup`, `/today`, OAuth 콜백, DM과 스케줄러는 아직 연결하지 않았다.
+`/help`에서 사용법과 연결 상태를 볼 수 있다. `/setup handle:핸들 count:3`은 solved.ac 프로필 조회 후 초기 설정을 저장한다. 서버에 `SOLVED_AC_CLIENT_ID`와 `SOLVED_AC_CLIENT_SECRET`을 모두 설정해야 한다.
+
+`/settings`는 설정 조회, `count`와 `reminder` 옵션은 설정 변경이다. `/skip days:1`, `/resume`은 학습 정지 상태를 저장·해제한다. `/curriculum track:cache`는 트랙을 저장하고 현재 단계를 보여준다. 각 사용자는 자신의 데이터만 변경한다. 데이터는 `BOT_DATA_DIR` (기본 `data`) 아래에 저장한다.
+
+`SOLVED_AC_REDIRECT_URI`가 설정돼 있으면 `127.0.0.1:8787/oauth/callback`에서 OAuth 콜백을 받는다. `/connect`는 본인에게만 보이는 인증 링크를 만들고 `/account`는 저장된 연결 계정을 보여준다. HTTPS reverse proxy로 콜백만 연결하고 Backstage에 동일한 Redirect URI를 등록해야 한다. 콜백 URL의 쿼리는 인증 코드가 있으므로 프록시 접근 로그에서 기록하지 않는다. 링크는 10분 동안 유효하며 재시작 시 다시 생성해야 한다.
+
+신규 문제 검색, 풀이 확인, 자동 DM과 AI 도움은 아직 연결하지 않았다. `/today`는 현재 그 제한을 안내한다. 알림 시각을 저장해도 자동 DM은 시작되지 않는다. `/setup`은 프로필 설정이며 OAuth 계정 소유 인증을 대신하지 않는다. 라이브 solved.ac 응답은 아직 검증하지 않았다.
 
 초기 설정, 일일 배정, 풀이 확인과 알림, 스킵과 재개, 커리큘럼, 막힌 문제 도움의 핵심 로직과 solved.ac OAuth 클라이언트가 있다. Discord 연결 확인용 바이너리를 제공하며 실서비스 연결은 아래 작업에 남겨 두었다.
 
