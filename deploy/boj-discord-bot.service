@@ -1,0 +1,26 @@
+[Unit]
+Description=Kote Mata Discord Bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=bojbot
+Group=bojbot
+WorkingDirectory=/var/lib/boj-discord-bot
+EnvironmentFile=/etc/boj-discord-bot/bot.env
+ExecStart=/opt/boj-discord-bot/boj-discord-bot
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/boj-discord-bot
+
+[Install]
+WantedBy=multi-user.target
