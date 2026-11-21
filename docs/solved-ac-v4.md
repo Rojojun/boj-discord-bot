@@ -29,6 +29,14 @@
 
 ## Rust 연결 지점
 
+### 홈서버 응답 확인 (2026-11-21)
+
+- 앱 인증으로 문제 목록 조회 HTTP 200 확인. 목록 키는 `problems`이며 `total`, `page`, `pageSize`를 함께 반환한다.
+- 문제 목록 항목의 `titles`는 `language`, `title`, `isOriginal`, `latex`, `html`을 가진 배열이다. 태그 배열은 `id`, `key`, `isMeta`를 가진다. 목록에 `ojLinks`는 없다.
+- 문제 상세의 `ojLinks`는 `ojId`, `ojName`, `nativeProblemId`, `url`, `logoUrl`을 가진 배열이다. 예시 응답에서 BOJ 1000의 URL을 확인했다.
+- Rust 추천 경로는 목록에서 난이도·태그 후보를 추린 뒤 상세에서 HTTPS 링크를 가져온다. 같은 문제의 `subId`도 보존한다. OAuth 미사용 추천이므로 `userStatus`를 풀이 여부로 사용하지 않는다.
+- 최종 `/today` 전체 흐름은 수정 배포 후 운영 검증이 필요하다.
+
 | 확인할 API | Rust 연결 지점 |
 |---|---|
 | 핸들과 티어 조회 | `ProfileLookup` |

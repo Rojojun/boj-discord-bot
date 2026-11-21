@@ -21,7 +21,7 @@ impl ProfileLookup for Source {
     }
 }
 impl RecommendationSource for Source {
-    fn problems(&self) -> Result<Vec<Candidate>, String> {
+    fn problems(&self, _: u8, _: &[&str], _: usize) -> Result<Vec<Candidate>, String> {
         if self.offline {
             return Err("offline".into());
         }

@@ -28,7 +28,7 @@ try:
     print("최상위 형식:", type(body).__name__)
     if isinstance(body, dict):
         print("최상위 필드:", ", ".join(body))
-    items = body if isinstance(body, list) else body.get("items") if isinstance(body, dict) else None
+    items = body if isinstance(body, list) else body.get("problems", body.get("items")) if isinstance(body, dict) else None
     if isinstance(items, list):
         print("문제 개수:", len(items))
         if items and isinstance(items[0], dict):

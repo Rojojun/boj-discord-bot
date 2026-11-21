@@ -22,7 +22,7 @@ pub struct Candidate {
 }
 
 pub trait RecommendationSource: ProfileLookup {
-    fn problems(&self) -> Result<Vec<Candidate>, String>;
+    fn problems(&self, tier: u8, tags: &[&str], limit: usize) -> Result<Vec<Candidate>, String>;
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,7 +86,7 @@ impl RecommendationStore {
                     .into(),
             ),
         };
-        let candidates = source.problems()?;
+        let candidates = source.problems(tier, tags, usize::from(settings.daily_count))?;
         let mut problems = Vec::new();
         for level in [
             Some(tier),

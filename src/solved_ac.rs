@@ -203,36 +203,101 @@ impl ProfileLookup for SolvedAc {
 }
 
 impl RecommendationSource for SolvedAc {
-    fn problems(&self) -> Result<Vec<Candidate>, String> {
-        let mut candidates = Vec::new();
-        let mut received = 0;
-        // Do not assume v3's search grammar works in v4. Filter levels and stage tags
-        // locally, using a bounded set of public list pages. No solve-state claims.
-        for page in 1..=5 {
-            let mut url = endpoint(&["problems"]);
-            url.query_pairs_mut().append_pair("page", &page.to_string());
-            let body: serde_json::Value =
-                decode(self.request("GET", &url, None).call()).map_err(recommendation_api_error)?;
-            let items = list_items(&body).ok_or(
-                "solved.ac 문제 목록 응답 형식을 읽지 못했습니다. 실응답 형식 확인이 필요합니다.",
-            )?;
-            received += items.len();
-            for item in items {
-                if let Some(candidate) = parse_candidate(item) {
-                    candidates.push(candidate);
-                }
-            }
-            if items.len() < 50 {
-                break;
-            }
-        }
-        if received > 0 && candidates.is_empty() {
-            return Err("목록은 받았지만 난이도·제목·HTTPS 제출 링크가 있는 후보를 읽지 못했습니다. 관리자에게 check-solved-ac.py로 응답 형식을 확인해달라고 요청하세요.".into());
-        }
-        Ok(candidates)
+    fn problems(&self, tier: u8, tags: &[&str], limit: usize) -> Result<Vec<Candidate>, String> {
+        recommend_from(tier, tags, limit, |url| {
+            decode(self.request("GET", url, None).call())
+        })
     }
 }
 
+fn recommend_from(
+    tier: u8,
+    tags: &[&str],
+    limit: usize,
+    mut load: impl FnMut(&Url) -> Result<serde_json::Value, ApiError>,
+) -> Result<Vec<Candidate>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut metadata = Vec::new();
+    // Do not assume v3's search grammar works in v4. Filter levels and stage tags
+    // locally, using a bounded set of public list pages. No solve-state claims.
+    for page in 1..=5 {
+        let mut url = endpoint(&["problems"]);
+        url.query_pairs_mut().append_pair("page", &page.to_string());
+        let body = load(&url).map_err(recommendation_api_error)?;
+        let items = list_items(&body).ok_or(
+            "solved.ac 문제 목록 응답 형식을 읽지 못했습니다. 실응답 형식 확인이 필요합니다.",
+        )?;
+        for item in items {
+            if let Some(candidate) = parse_metadata(item)
+                && candidate.level.abs_diff(tier) <= 1
+                && (tags.is_empty()
+                    || candidate
+                        .tags
+                        .iter()
+                        .any(|tag| tags.contains(&tag.as_str())))
+                && !metadata
+                    .iter()
+                    .any(|(saved, _): &(Candidate, serde_json::Value)| {
+                        saved.problem.id == candidate.problem.id
+                    })
+            {
+                metadata.push((candidate, item.clone()));
+            }
+        }
+        let page_size = body
+            .get("pageSize")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|size| *size > 0)
+            .unwrap_or(50);
+        if (items.len() as u64) < page_size {
+            break;
+        }
+    }
+    metadata.sort_by_key(|(candidate, _)| {
+        if candidate.level == tier {
+            0
+        } else if candidate.level < tier {
+            1
+        } else {
+            2
+        }
+    });
+    let mut candidates = Vec::new();
+    let had_matches = !metadata.is_empty();
+    // The list omits ojLinks. Fetch details only for matching candidates,
+    // with a bounded allowance for candidates that have no usable link.
+    for (_, mut item) in metadata.into_iter().take(limit.saturating_mul(2).min(20)) {
+        let problem_id = item
+            .get("problemId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("문제 ID를 읽지 못했습니다.")?;
+        let mut url = endpoint(&["problems", &problem_id.to_string()]);
+        if let Some(sub) = sub_id(&item) {
+            url.query_pairs_mut().append_pair("sub", &sub);
+        }
+        let detail = match load(&url) {
+            Ok(detail) => detail,
+            Err(ApiError::NotFound) => continue,
+            Err(error) => return Err(recommendation_api_error(error)),
+        };
+        // Never invent judge URLs from problem IDs.
+        if let Some(links) = detail.get("ojLinks") {
+            item["ojLinks"] = links.clone();
+        }
+        if let Some(candidate) = parse_candidate(&item) {
+            candidates.push(candidate);
+            if candidates.len() >= limit {
+                break;
+            }
+        }
+    }
+    if had_matches && candidates.is_empty() {
+        return Err("난이도에 맞는 문제는 찾았지만 상세 응답에서 HTTPS 제출 링크를 읽지 못했습니다. 관리자에게 문제 상세 응답의 ojLinks 확인을 요청하세요.".into());
+    }
+    Ok(candidates)
+}
 fn recommendation_api_error(error: ApiError) -> String {
     match error {
         ApiError::Permission => {
@@ -250,10 +315,20 @@ fn recommendation_api_error(error: ApiError) -> String {
 }
 
 fn list_items(body: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    body.as_array().or_else(|| body.get("items")?.as_array())
+    body.as_array()
+        .or_else(|| body.get("problems").and_then(serde_json::Value::as_array))
+        .or_else(|| body.get("items").and_then(serde_json::Value::as_array))
 }
 
-fn parse_candidate(item: &serde_json::Value) -> Option<Candidate> {
+fn sub_id(item: &serde_json::Value) -> Option<String> {
+    match item.get("subId")? {
+        serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_metadata(item: &serde_json::Value) -> Option<Candidate> {
     let id = item.get("problemId").or_else(|| item.get("id"))?.as_u64()?;
     let level = item.get("level").or_else(|| item.get("tier"))?.as_u64()?;
     if id == 0 || !(1..=30).contains(&level) {
@@ -271,15 +346,6 @@ fn parse_candidate(item: &serde_json::Value) -> Option<Candidate> {
     if title.trim().is_empty() {
         return None;
     }
-    let submission_url = item.get("ojLinks")?.as_array()?.iter().find_map(|link| {
-        let raw = link.as_str().or_else(|| link.get("url")?.as_str())?;
-        let url = Url::parse(raw).ok()?;
-        (url.scheme() == "https"
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none())
-        .then(|| url.to_string())
-    })?;
     let tags = item
         .get("tags")
         .and_then(serde_json::Value::as_array)
@@ -288,15 +354,34 @@ fn parse_candidate(item: &serde_json::Value) -> Option<Candidate> {
         .filter_map(|tag| tag.as_str().or_else(|| tag.get("key")?.as_str()))
         .map(str::to_owned)
         .collect();
+    let id = match sub_id(item) {
+        Some(sub) => format!("{id}:{sub}"),
+        None => id.to_string(),
+    };
     Some(Candidate {
         problem: Problem {
-            id: id.to_string(),
+            id,
             title: title.chars().take(160).collect(),
-            submission_url,
+            submission_url: String::new(),
         },
         level: level as u8,
         tags,
     })
+}
+
+fn parse_candidate(item: &serde_json::Value) -> Option<Candidate> {
+    let mut candidate = parse_metadata(item)?;
+    candidate.problem.submission_url =
+        item.get("ojLinks")?.as_array()?.iter().find_map(|link| {
+            let raw = link.as_str().or_else(|| link.get("url")?.as_str())?;
+            let url = Url::parse(raw).ok()?;
+            (url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none())
+            .then(|| url.to_string())
+        })?;
+    Some(candidate)
 }
 
 fn random_token() -> io::Result<String> {
@@ -341,6 +426,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn observed_v4_list_without_links_loads_only_selected_problem_detail() {
+        let list = serde_json::json!({"total": 3,"page":1,"pageSize":50,"problems":[
+            {"id":9001,"problemId":1001,"subId":null,"level":9,"titles":[{"language":"ko","title":"쉬운 문제","isOriginal":true,"latex":false,"html":false}],"tags":[{"id":1,"key":"dp","isMeta":false}]},
+            {"id":9000,"problemId":1000,"subId":2,"level":10,"titles":[{"language":"ko","title":"A+B","isOriginal":true,"latex":false,"html":false}],"tags":[{"id":1,"key":"dp","isMeta":false}]},
+            {"id":9002,"problemId":1002,"subId":null,"level":10,"titles":[{"language":"ko","title":"다른 주제"}],"tags":[{"key":"graphs"}]}
+        ]});
+        let detail = serde_json::json!({"ojLinks":[{"ojId":"boj","ojName":"Baekjoon Online Judge","nativeProblemId":"1000","url":"https://www.acmicpc.net/problem/1000","logoUrl":"https://cdn.solved.ac/assets/icons-oj/acmicpc-net.svg"}]});
+        let mut calls = Vec::new();
+        let result = recommend_from(10, &["dp"], 1, |url| {
+            calls.push(url.clone());
+            match url.path() {
+                "/api/v4/problems" => Ok(list.clone()),
+                "/api/v4/problems/1000" => Ok(detail.clone()),
+                _ => panic!("unselected problem fetched"),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].query(), Some("sub=2"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].problem.id, "1000:2");
+        assert_eq!(result[0].problem.title, "A+B");
+        assert_eq!(
+            result[0].problem.submission_url,
+            "https://www.acmicpc.net/problem/1000"
+        );
+    }
+
+    #[test]
+    fn missing_detail_link_never_turns_into_guessed_boj_url() {
+        let list = serde_json::json!({"total":1,"page":1,"pageSize":50,"problems":[{"problemId":1000,"level":10,"titles":[{"language":"ko","title":"A+B"}],"tags":[]}]});
+        let result = recommend_from(10, &[], 1, |url| {
+            if url.path() == "/api/v4/problems" {
+                Ok(list.clone())
+            } else {
+                Ok(serde_json::json!({"ojLinks":[]}))
+            }
+        });
+        assert!(result.unwrap_err().contains("제출 링크"));
+    }
+
+    #[test]
     fn recommendation_parser_requires_real_https_links_and_valid_levels() {
         let valid = serde_json::json!({"problemId":123,"level":10,"title":"문제", "tags":[{"key":"dp"}],"ojLinks":[{"url":"https://judge.example/problems/7"}]});
         let candidate = parse_candidate(&valid).unwrap();
@@ -364,6 +491,10 @@ mod tests {
             assert!(parse_candidate(&invalid).is_none());
         }
         assert!(list_items(&serde_json::json!({"error":"bad request"})).is_none());
+        let observed = serde_json::json!({"total":1,"page":1,"pageSize":50,"problems":[valid]});
+        let parsed = list_items(&observed).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parse_candidate(&parsed[0]).unwrap().problem.id, "123");
         assert_eq!(
             list_items(&serde_json::json!({"items":[]})).unwrap().len(),
             0

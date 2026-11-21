@@ -35,6 +35,10 @@ pub struct PauseStore {
 }
 
 impl PauseStore {
+    pub fn current(&self, user: u64, now: DateTime<Utc>) -> io::Result<PauseStatus> {
+        status(&self.users, user, seoul_time(now).date_naive())
+    }
+
     pub fn new(data_dir: &Path) -> Self {
         Self {
             users: data_dir.join("users"),

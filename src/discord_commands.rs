@@ -69,27 +69,32 @@ impl Commands {
         now: DateTime<Utc>,
     ) -> String {
         match name {
+            "start" => match self.settings.read(user) {
+                Ok(None) => "**코테-마타-봇 시작하기**\n내 수준에 맞는 연습 문제를 매일 추천받으세요.\n\n1. solved.ac 프로필에서 본인의 아이디(핸들)를 확인하세요. Discord 닉네임과는 다릅니다.\n2. `/setup`을 선택하고 `handle`에 그 아이디, `count`에 하루 문제 수를 넣으세요. 처음에는 1~3개를 추천합니다.\n3. 설정 완료 후 `/today`를 실행하세요.\n\n추천 문제는 이미 푼 문제일 수도 있습니다. 지금은 별도의 계정 인증 없이 시작할 수 있습니다.".into(),
+                Ok(Some(settings)) => match self.pause.current(user, now) {
+                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 해당 저지에서 풀면 됩니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n이미 푼 문제 여부와 완료 상태는 아직 자동 확인하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
+                    Ok(_) => "**지금은 학습을 쉬고 있습니다.**\n다시 시작하려면 `/resume` → `/today` 순서로 실행하세요.\n내 설정은 `/settings`에서 확인할 수 있습니다.".into(),
+                    Err(_) => STORAGE_ERROR.into(),
+                },
+                Err(_) => STORAGE_ERROR.into(),
+            },
             "ping" => "퐁! 코테-마타-봇이 연결되어 있어요.".into(),
-            "help" => format!(
+            "help" => String::from(
                 "**코테-마타-봇 사용 안내**\n\
+                 처음이라면 `/start`를 실행하세요.\n\n\
+                 **매일 사용하는 명령**\n\
                  `/setup handle:내핸들 count:3` — 핸들 조회 후 하루 문제 수 저장\n\
-                 `/connect` — 내 solved.ac 계정 OAuth 연결\n\
-                 `/account` — 연결된 계정 조회\n\
+                 `/today` — 오늘 추천 문제와 풀이할 사이트 링크\n\
                  `/settings` — 내 설정 조회\n\
                  `/settings count:2` — 하루 문제 수 변경\n\
-                 `/settings reminder:21:00` — 알림 시각 저장 (한국 시간)\n\
-                 `/curriculum` — 커리큘럼 조회\n\
-                 `/curriculum track:cache` — 캐시 구현 트랙 선택\n\
                  `/skip days:1` — 1~7일 쉬기\n\
                  `/resume` — 학습 재개\n\
-                 `/today` — 현재 티어·트랙에 맞는 오늘의 추천 문제\n\n\
-                 **현재 연결 상태**\nsolved.ac 앱: {}\n\
-                 `/today`는 OAuth 없이 앱 인증으로 조회한 추천입니다. 이미 푼 문제 여부는 확인하지 않습니다. 풀이 확인·자동 DM·AI 도움은 아직 연결 중입니다.",
-                if self.api.is_some() {
-                    "설정됨 (실호출은 /setup으로 확인)"
-                } else {
-                    "미설정"
-                }
+                 \n**선택 기능**\n\
+                 `/curriculum` — 트랙 조회·선택 (캐시 구현/코딩면접/일반)\n\
+                 `/settings reminder:21:00` — 알림 시각 저장 (자동 알림은 아직 미지원)\n\
+                 `/connect`, `/account` — 계정 인증·연결 확인 (현재 추천에는 불필요)\n\n\
+                 **현재 가능한 것:** 티어·트랙별 추천, 하루 추천 보관, 설정 변경, 쉬기·재개.\n\
+                 **아직 지원하지 않는 것:** 이미 푼 문제 제외, 완료 자동 확인, 자동 DM, AI 도움.",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -292,6 +297,7 @@ pub fn definitions() -> Vec<CreateCommand> {
     vec![
         CreateCommand::new("ping").description("봇 연결 확인"),
         CreateCommand::new("help").description("사용 가능한 명령과 연결 상태 안내"),
+        CreateCommand::new("start").description("처음 시작하기 · 내 설정에 맞는 다음 단계 안내"),
         CreateCommand::new("connect").description("내 solved.ac 계정 OAuth 연결"),
         CreateCommand::new("account").description("연결된 solved.ac 계정 조회"),
         CreateCommand::new("setup")
