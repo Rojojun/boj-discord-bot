@@ -1,5 +1,6 @@
 pub mod account_link;
 pub mod assignment;
+pub mod checkin;
 pub mod curriculum;
 pub mod discord_commands;
 pub mod oauth_callback;

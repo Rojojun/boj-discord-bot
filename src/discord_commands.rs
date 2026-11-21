@@ -1,4 +1,5 @@
 use crate::account_link::AccountLinks;
+use crate::checkin::{CheckinError, Checkins, Progress};
 use crate::curriculum::{CurriculumStore, Plan};
 use crate::pause::{PauseError, PauseStatus, PauseStore};
 use crate::recommendation::{Recommendation, RecommendationStore};
@@ -18,6 +19,7 @@ pub struct Commands {
     links: AccountLinks,
     redirect: Option<String>,
     recommendations: RecommendationStore,
+    checkins: Checkins,
 }
 
 const STORAGE_ERROR: &str =
@@ -34,6 +36,7 @@ impl Commands {
             links: AccountLinks::new(data),
             redirect: None,
             recommendations: RecommendationStore::new(data),
+            checkins: Checkins::new(data),
         }
     }
 
@@ -61,6 +64,10 @@ impl Commands {
             .is_some_and(|api| self.links.complete(state, code, api).is_ok())
     }
 
+    pub fn checkins(&self) -> &Checkins {
+        &self.checkins
+    }
+
     pub fn execute(
         &self,
         user: u64,
@@ -70,12 +77,31 @@ impl Commands {
     ) -> String {
         match name {
             "start" => match self.settings.read(user) {
-                Ok(None) => "**코테-마타-봇 시작하기**\n내 수준에 맞는 연습 문제를 매일 추천받으세요.\n\n1. solved.ac 프로필에서 본인의 아이디(핸들)를 확인하세요. Discord 닉네임과는 다릅니다.\n2. `/setup`을 선택하고 `handle`에 그 아이디, `count`에 하루 문제 수를 넣으세요. 처음에는 1~3개를 추천합니다.\n3. 설정 완료 후 `/today`를 실행하세요.\n\n추천 문제는 이미 푼 문제일 수도 있습니다. 지금은 별도의 계정 인증 없이 시작할 수 있습니다.".into(),
+                Ok(None) => "**코테-마타-봇 시작하기**\n내 수준에 맞는 연습 문제를 매일 추천받으세요.\n\n1. solved.ac 프로필에서 본인의 아이디(핸들)를 확인하세요. Discord 닉네임과는 다릅니다.\n2. `/setup`을 선택하고 `handle`에 그 아이디, `count`에 하루 문제 수를 넣으세요. 처음에는 1~3개를 추천합니다.\n3. `/today`로 추천을 받고, 풀었으면 `/done`으로 체크하세요.\n\n추천 문제는 이미 푼 문제일 수도 있습니다. 지금은 별도의 계정 인증 없이 시작할 수 있습니다.".into(),
                 Ok(Some(settings)) => match self.pause.current(user, now) {
-                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 해당 저지에서 풀면 됩니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n이미 푼 문제 여부와 완료 상태는 아직 자동 확인하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
+                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n이미 푼 문제 여부와 완료 상태는 아직 자동 확인하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
                     Ok(_) => "**지금은 학습을 쉬고 있습니다.**\n다시 시작하려면 `/resume` → `/today` 순서로 실행하세요.\n내 설정은 `/settings`에서 확인할 수 있습니다.".into(),
                     Err(_) => STORAGE_ERROR.into(),
                 },
+                Err(_) => STORAGE_ERROR.into(),
+            },
+            "done" => {
+                let index = match integer(options, "problem").map(usize::try_from).transpose() {
+                    Ok(index) => index,
+                    Err(_) => return "문제 번호는 /today에 표시된 1부터 시작하는 번호를 입력하세요.".into(),
+                };
+                let undo = options.iter().find(|option| option.name == "undo").and_then(|option| option.value.as_bool()).unwrap_or(false);
+                match self.checkins.mark(user, now, index, undo) {
+                    Ok(progress) => format!("{}\n{}", if undo { "완료 체크를 취소했습니다." } else { "직접 완료 체크를 저장했습니다!" }, describe_progress(&progress)),
+                    Err(CheckinError::NoRecommendation) => "먼저 /today로 오늘의 추천을 받아주세요. 추천을 받은 뒤 /done으로 완료 체크할 수 있습니다.".into(),
+                    Err(CheckinError::Paused) => "학습 정지 중입니다. /resume으로 재개한 뒤 체크해주세요.".into(),
+                    Err(CheckinError::InvalidIndex) => "오늘 추천에 없는 번호입니다. /today의 문제 번호를 확인하세요.".into(),
+                    Err(CheckinError::Storage(_)) => STORAGE_ERROR.into(),
+                }
+            }
+            "status" => match self.checkins.progress(user, now) {
+                Ok(Some(progress)) => describe_progress(&progress),
+                Ok(None) => "아직 오늘 추천이 없습니다. /today로 문제를 받아주세요. 오늘 추천을 받지 않은 사람에게는 알림을 보내지 않습니다.".into(),
                 Err(_) => STORAGE_ERROR.into(),
             },
             "ping" => "퐁! 코테-마타-봇이 연결되어 있어요.".into(),
@@ -85,16 +111,19 @@ impl Commands {
                  **매일 사용하는 명령**\n\
                  `/setup handle:내핸들 count:3` — 핸들 조회 후 하루 문제 수 저장\n\
                  `/today` — 오늘 추천 문제와 풀이할 사이트 링크\n\
+                 `/done` — 오늘 추천 전체를 직접 완료 체크\n\
+                 `/done problem:1` — 1번만 체크 · `undo:true`로 취소\n\
+                 `/status` — 오늘의 직접 체크 현황\n\
                  `/settings` — 내 설정 조회\n\
                  `/settings count:2` — 하루 문제 수 변경\n\
                  `/skip days:1` — 1~7일 쉬기\n\
                  `/resume` — 학습 재개\n\
                  \n**선택 기능**\n\
                  `/curriculum` — 트랙 조회·선택 (캐시 구현/코딩면접/일반)\n\
-                 `/settings reminder:21:00` — 알림 시각 저장 (자동 알림은 아직 미지원)\n\
+                 `/settings reminder:21:00` — 미체크 채널 알림 시각 (한국 시간, 기본 21:00)\n\
                  `/connect`, `/account` — 계정 인증·연결 확인 (현재 추천에는 불필요)\n\n\
-                 **현재 가능한 것:** 티어·트랙별 추천, 하루 추천 보관, 설정 변경, 쉬기·재개.\n\
-                 **아직 지원하지 않는 것:** 이미 푼 문제 제외, 완료 자동 확인, 자동 DM, AI 도움.",
+                 오늘 추천을 받은 뒤 체크가 남아 있으면 설정 시각 이후 이 채널에서 하루 한 번 멘션합니다. 쉬는 사람은 제외합니다.\n\
+                 체크는 자기 신고입니다. 실제 풀이 자동 확인·이미 푼 문제 제외·DM·AI 도움은 아직 미지원입니다.",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -161,7 +190,7 @@ impl Commands {
                     &NoProfileLookup,
                 ) {
                     Ok(settings) => format!(
-                        "설정 변경 완료.\n{}\n자동 DM은 아직 연결 중입니다.",
+                        "설정 변경 완료.\n{}\n오늘 추천을 받고 미체크 문제가 남아 있으면 이 채널에서 설정 시각 이후 하루 한 번 멘션합니다. DM은 보내지 않습니다.",
                         describe(&settings)
                     ),
                     Err(error) => settings_error(error),
@@ -208,7 +237,13 @@ impl Commands {
                     return API_REQUIRED.into();
                 };
                 match self.recommendations.today(user, now, &self.settings, api) {
-                    Ok(recommendation) => describe_recommendation(&recommendation),
+                    Ok(recommendation) => {
+                        let checked = match self.checkins.progress(user, now) {
+                            Ok(Some(progress)) => format!("직접 완료 체크: {}/{}", progress.count(), progress.total()),
+                            _ => "체크 현황은 /status에서 확인하세요.".into(),
+                        };
+                        format!("{}\n\n{}\n풀었으면 /done · 일부만 풀었으면 /done problem:1\n미체크 문제가 있으면 설정한 알림 시각 이후 이 채널에서 하루 한 번 멘션합니다. 시각 변경은 /settings reminder:21:00", describe_recommendation(&recommendation), checked)
+                    },
                     Err(message) => message,
                 }
             }
@@ -229,6 +264,36 @@ fn describe(settings: &Settings) -> String {
         "핸들: {}\n티어: {}\n하루 문제 수: {}\n알림 시각: {} (한국 시간)",
         settings.solved_ac_handle, settings.tier, settings.daily_count, settings.reminder_time
     )
+}
+
+fn describe_progress(progress: &Progress) -> String {
+    let mut lines = vec![format!(
+        "**오늘 직접 완료 체크: {}/{}**",
+        progress.count(),
+        progress.total()
+    )];
+    for (index, problem) in progress.recommendation.problems.iter().enumerate() {
+        lines.push(format!(
+            "{} {}. {}",
+            if progress.checked.contains(&problem.id) {
+                "✅"
+            } else {
+                "⬜"
+            },
+            index + 1,
+            problem.title
+        ));
+    }
+    lines.push(if progress.count() == progress.total() {
+        "오늘 추천을 모두 체크했습니다. 미체크 알림 대상에서 제외됩니다."
+    } else {
+        "/done으로 전체 체크 · /done problem:1로 한 문제 체크 · /done problem:1 undo:true로 취소"
+    }.into());
+    lines.push(
+        "직접 체크한 기록이며 실제 저지 풀이 확인이나 커리큘럼 완료 실적에 반영하지 않습니다."
+            .into(),
+    );
+    lines.join("\n")
 }
 
 fn describe_recommendation(recommendation: &Recommendation) -> String {
@@ -298,6 +363,23 @@ pub fn definitions() -> Vec<CreateCommand> {
         CreateCommand::new("ping").description("봇 연결 확인"),
         CreateCommand::new("help").description("사용 가능한 명령과 연결 상태 안내"),
         CreateCommand::new("start").description("처음 시작하기 · 내 설정에 맞는 다음 단계 안내"),
+        CreateCommand::new("done")
+            .description("오늘 추천을 직접 완료 체크 (옵션 없으면 전체)")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "problem",
+                    "/today의 문제 번호 (생략하면 전체)",
+                )
+                .min_int_value(1)
+                .max_int_value(10),
+            )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::Boolean,
+                "undo",
+                "true면 선택한 완료 체크 취소",
+            )),
+        CreateCommand::new("status").description("오늘의 직접 완료 체크 현황"),
         CreateCommand::new("connect").description("내 solved.ac 계정 OAuth 연결"),
         CreateCommand::new("account").description("연결된 solved.ac 계정 조회"),
         CreateCommand::new("setup")
@@ -315,7 +397,7 @@ pub fn definitions() -> Vec<CreateCommand> {
                 CreateCommandOption::new(
                     CommandOptionType::String,
                     "reminder",
-                    "한국 시간 HH:MM (자동 DM은 연결 중)",
+                    "미체크 채널 알림 시각 · 한국 시간 HH:MM",
                 )
                 .max_length(5),
             ),

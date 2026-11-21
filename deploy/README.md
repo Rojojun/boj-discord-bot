@@ -54,6 +54,8 @@ sudo journalctl -u boj-discord-bot -n 50 --no-pager
 ```
 
 연결 완료 로그를 확인한 뒤 지정한 Discord 채널에서 `/help` → `/setup handle:내핸들 count:3` → `/today`를 실행한다. 라이브 API 응답 검증은 운영에서 해야 하며 실패 시 `sudo python3 scripts/check-solved-ac.py`로 비밀 값 없이 응답 형식을 확인한다.
+
+수동 완료 체크와 채널 알림도 자동 시작한다. `/done`은 오늘 전체 체크, `/done problem:1`은 일부 체크, `/status`는 현황이다. 알림은 기본 한국 시간 21:00이며 `/settings reminder:HH:MM`으로 사용자별 변경한다. 오늘 추천이 있고 체크가 남아 있으며 쉬는 상태가 아닌 사용자만 지정 채널에서 하루 한 번 멘션한다. 시각이 이미 지난 날 배포하면 첫 스캔에서 알림이 나올 수 있다. 봇의 채널 보기·메시지 보내기 권한을 허용해야 한다. DM과 실제 풀이 자동 조회는 하지 않는다.
 실패를 반복해 시작 제한에 걸리면 설정을 수정하고 `sudo systemctl reset-failed boj-discord-bot` 후 다시 시작한다.
 
 ## 운영 및 업데이트

@@ -3,11 +3,78 @@ use boj_discord_bot::{
     solved_ac::SolvedAc,
 };
 use serenity::all::{
-    ApplicationId, ChannelId, Client, Context, CreateAttachment, EditInteractionResponse,
-    EventHandler, GatewayIntents, GuildId, Interaction, Ready,
+    ApplicationId, ChannelId, Client, Context, CreateAllowedMentions, CreateAttachment,
+    CreateMessage, EditInteractionResponse, EventHandler, GatewayIntents, GuildId, Interaction,
+    Ready,
 };
 use serenity::async_trait;
 use std::{env, error::Error, io, path::PathBuf, sync::Arc};
+
+async fn checkin_scheduler(
+    commands: Arc<Commands>,
+    http: Arc<serenity::http::Http>,
+    channel: ChannelId,
+) {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        let store = Arc::clone(&commands);
+        let due = tokio::task::spawn_blocking(move || {
+            store
+                .checkins()
+                .claim_due(channel.get(), std::time::SystemTime::now().into())
+        })
+        .await;
+        let notices = match due {
+            Ok(Ok(notices)) => notices,
+            _ => {
+                eprintln!("수동 완료 체크 알림 스캔 실패. 데이터 폴더 권한을 확인하세요.");
+                continue;
+            }
+        };
+        for notice in notices {
+            let store = Arc::clone(&commands);
+            let refreshed = tokio::task::spawn_blocking(move || {
+                let progress = store
+                    .checkins()
+                    .still_due(&notice, std::time::SystemTime::now().into());
+                (notice, progress)
+            })
+            .await;
+            let (notice, checked, total) = match refreshed {
+                Ok((notice, Ok(Some((checked, total))))) => (notice, checked, total),
+                // Markers remain claimed on a race with /done, /skip, or midnight.
+                Ok((_, Ok(None))) => continue,
+                _ => {
+                    eprintln!("완료 체크 알림 발송 전 재확인 실패.");
+                    continue;
+                }
+            };
+            let message = CreateMessage::new()
+                .content(format!("📣 <@{}> 오늘 추천 {}개 중 {}개는 아직 **완료 체크가 없습니다** 👀\n풀었다면 `/done`, 일부만 풀었다면 `/done problem:1`로 체크해주세요. 실제 풀이 여부를 조회한 알림은 아닙니다.", notice.user, total, total - checked))
+                .allowed_mentions(CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false).users([notice.user]));
+            if let Err(error) = channel.send_message(&http, message).await {
+                let rejected = matches!(&error, serenity::Error::Http(error) if error.status_code().is_some_and(|status| status.is_client_error()));
+                if rejected {
+                    let store = Arc::clone(&commands);
+                    let retry =
+                        tokio::task::spawn_blocking(move || store.checkins().retry(&notice)).await;
+                    if !matches!(retry, Ok(Ok(()))) {
+                        eprintln!("알림 재시도 상태 저장 실패.");
+                    }
+                    eprintln!(
+                        "채널 알림이 Discord에서 거부됐습니다. 봇의 채널 보기·메시지 보내기 권한과 요청 제한을 확인하세요. 다음 스캔에서 재시도합니다."
+                    );
+                } else {
+                    eprintln!(
+                        "채널 알림 전송 결과가 불확실합니다. 중복 방지를 위해 오늘은 재발송하지 않습니다."
+                    );
+                }
+            }
+        }
+    }
+}
 
 struct Handler {
     guild: GuildId,
@@ -130,7 +197,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .event_handler(Handler {
             guild,
             channel,
-            commands,
+            commands: Arc::clone(&commands),
         })
         .await?;
 
@@ -139,6 +206,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         guild.create_command(&client.http, definition).await?;
     }
     println!("학습 설정 명령 등록 완료. /help로 사용법을 확인하세요.");
+    tokio::spawn(checkin_scheduler(
+        commands,
+        Arc::clone(&client.http),
+        channel,
+    ));
+    println!("수동 완료 체크 알림 활성화: 설정 시각 이후 지정 채널로 하루 한 번 (60초 간격 확인)");
 
     let shards = client.shard_manager.clone();
     tokio::spawn(async move {
