@@ -3,8 +3,8 @@ use boj_discord_bot::{
     solved_ac::SolvedAc,
 };
 use serenity::all::{
-    ApplicationId, ChannelId, Client, Context, EditInteractionResponse, EventHandler,
-    GatewayIntents, GuildId, Interaction, Ready,
+    ApplicationId, ChannelId, Client, Context, CreateAttachment, EditInteractionResponse,
+    EventHandler, GatewayIntents, GuildId, Interaction, Ready,
 };
 use serenity::async_trait;
 use std::{env, error::Error, io, path::PathBuf, sync::Arc};
@@ -41,13 +41,17 @@ impl EventHandler for Handler {
         })
         .await
         .unwrap_or_else(|_| "명령 처리 중 오류가 발생했습니다. 잠시 후 다시 시도하세요.".into());
-        // Keep responses within Discord's content limit, including API-supplied handles.
-        let text: String = text.chars().take(1950).collect();
-        if command
-            .edit_response(&ctx.http, EditInteractionResponse::new().content(text))
-            .await
-            .is_err()
-        {
+        let response = if text.encode_utf16().count() > 1900 {
+            EditInteractionResponse::new()
+                .content("응답이 길어 전체 내용을 파일로 첨부했습니다.")
+                .new_attachment(CreateAttachment::bytes(
+                    text.into_bytes(),
+                    "recommendations.txt",
+                ))
+        } else {
+            EditInteractionResponse::new().content(text)
+        };
+        if command.edit_response(&ctx.http, response).await.is_err() {
             eprintln!("명령 응답 전송 실패. Discord 연결 상태를 확인하세요.");
         }
     }

@@ -1,7 +1,7 @@
 # Debian 13 x86_64 바이너리 배포
 
 서버에서 최초 빌드 후 systemd가 실행 파일을 직접 실행한다. 실행 중에는 Rust나 Cargo가 필요 없다.
-배포 대상은 `/help`, `/setup`, `/settings`, `/skip`, `/resume`, `/curriculum` 등 학습 설정 명령이다. `/setup`의 실제 프로필 조회에는 solved.ac 앱 인증값이 필요하다. 신규 문제 배정은 아직 연결 중이다. 홈서버의 인터넷 연결과 DNS가 필요하며 현재 인바운드 포트는 필요 없다.
+배포 대상은 `/help`, `/setup`, `/settings`, `/skip`, `/resume`, `/curriculum`, `/today` 명령이다. `/setup`과 `/today`에는 solved.ac 앱 인증값이 필요하다. `/today`는 OAuth 없이 풀이 여부 미확인 추천을 제공하며 미해결 과제로 집계하지 않는다. 홈서버의 인터넷 연결과 DNS가 필요하다. OAuth를 보류하려면 `SOLVED_AC_REDIRECT_URI`를 비워두면 되고 이 모드에는 인바운드 포트가 필요 없다.
 
 ## 1. 소스 전송 및 빌드
 
@@ -53,7 +53,7 @@ sudo systemctl status boj-discord-bot --no-pager
 sudo journalctl -u boj-discord-bot -n 50 --no-pager
 ```
 
-연결 완료 로그를 확인한 뒤 지정한 Discord 채널에서 `/ping`을 실행한다.
+연결 완료 로그를 확인한 뒤 지정한 Discord 채널에서 `/help` → `/setup handle:내핸들 count:3` → `/today`를 실행한다. 라이브 API 응답 검증은 운영에서 해야 하며 실패 시 `sudo python3 scripts/check-solved-ac.py`로 비밀 값 없이 응답 형식을 확인한다.
 실패를 반복해 시작 제한에 걸리면 설정을 수정하고 `sudo systemctl reset-failed boj-discord-bot` 후 다시 시작한다.
 
 ## 운영 및 업데이트

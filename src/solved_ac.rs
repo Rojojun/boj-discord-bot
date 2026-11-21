@@ -1,4 +1,8 @@
 use crate::settings::{LookupError, Profile, ProfileLookup};
+use crate::{
+    assignment::Problem,
+    recommendation::{Candidate, RecommendationSource},
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::{
     digest,
@@ -198,6 +202,103 @@ impl ProfileLookup for SolvedAc {
     }
 }
 
+impl RecommendationSource for SolvedAc {
+    fn problems(&self) -> Result<Vec<Candidate>, String> {
+        let mut candidates = Vec::new();
+        let mut received = 0;
+        // Do not assume v3's search grammar works in v4. Filter levels and stage tags
+        // locally, using a bounded set of public list pages. No solve-state claims.
+        for page in 1..=5 {
+            let mut url = endpoint(&["problems"]);
+            url.query_pairs_mut().append_pair("page", &page.to_string());
+            let body: serde_json::Value =
+                decode(self.request("GET", &url, None).call()).map_err(recommendation_api_error)?;
+            let items = list_items(&body).ok_or(
+                "solved.ac 문제 목록 응답 형식을 읽지 못했습니다. 실응답 형식 확인이 필요합니다.",
+            )?;
+            received += items.len();
+            for item in items {
+                if let Some(candidate) = parse_candidate(item) {
+                    candidates.push(candidate);
+                }
+            }
+            if items.len() < 50 {
+                break;
+            }
+        }
+        if received > 0 && candidates.is_empty() {
+            return Err("목록은 받았지만 난이도·제목·HTTPS 제출 링크가 있는 후보를 읽지 못했습니다. 관리자에게 check-solved-ac.py로 응답 형식을 확인해달라고 요청하세요.".into());
+        }
+        Ok(candidates)
+    }
+}
+
+fn recommendation_api_error(error: ApiError) -> String {
+    match error {
+        ApiError::Permission => {
+            "solved.ac 앱 인증이 거부됐습니다. 서버 Client ID와 Client Secret을 확인하세요.".into()
+        }
+        ApiError::RateLimited {
+            retry_after_seconds: Some(seconds),
+        } => format!("solved.ac 요청 제한입니다. {seconds}초 후 다시 시도하세요."),
+        ApiError::RateLimited { .. } => {
+            "solved.ac 요청 제한입니다. 잠시 후 다시 시도하세요.".into()
+        }
+        ApiError::InvalidResponse => "solved.ac 응답 형식을 읽지 못했습니다.".into(),
+        _ => "solved.ac 문제 조회에 실패했습니다. 잠시 후 다시 시도하세요.".into(),
+    }
+}
+
+fn list_items(body: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    body.as_array().or_else(|| body.get("items")?.as_array())
+}
+
+fn parse_candidate(item: &serde_json::Value) -> Option<Candidate> {
+    let id = item.get("problemId").or_else(|| item.get("id"))?.as_u64()?;
+    let level = item.get("level").or_else(|| item.get("tier"))?.as_u64()?;
+    if id == 0 || !(1..=30).contains(&level) {
+        return None;
+    }
+    let title = item
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            item.get("titles")?
+                .as_array()?
+                .iter()
+                .find_map(|title| title.get("title")?.as_str())
+        })?;
+    if title.trim().is_empty() {
+        return None;
+    }
+    let submission_url = item.get("ojLinks")?.as_array()?.iter().find_map(|link| {
+        let raw = link.as_str().or_else(|| link.get("url")?.as_str())?;
+        let url = Url::parse(raw).ok()?;
+        (url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none())
+        .then(|| url.to_string())
+    })?;
+    let tags = item
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| tag.as_str().or_else(|| tag.get("key")?.as_str()))
+        .map(str::to_owned)
+        .collect();
+    Some(Candidate {
+        problem: Problem {
+            id: id.to_string(),
+            title: title.chars().take(160).collect(),
+            submission_url,
+        },
+        level: level as u8,
+        tags,
+    })
+}
+
 fn random_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
     SystemRandom::new()
@@ -238,6 +339,36 @@ fn decode<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recommendation_parser_requires_real_https_links_and_valid_levels() {
+        let valid = serde_json::json!({"problemId":123,"level":10,"title":"문제", "tags":[{"key":"dp"}],"ojLinks":[{"url":"https://judge.example/problems/7"}]});
+        let candidate = parse_candidate(&valid).unwrap();
+        assert_eq!(candidate.problem.id, "123");
+        assert_eq!(
+            candidate.problem.submission_url,
+            "https://judge.example/problems/7"
+        );
+        assert_eq!(candidate.tags, ["dp"]);
+        for (field, value) in [
+            ("ojLinks", serde_json::json!([])),
+            (
+                "ojLinks",
+                serde_json::json!([{"url":"javascript:alert(1)"}]),
+            ),
+            ("level", serde_json::json!(99)),
+            ("title", serde_json::json!("")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(parse_candidate(&invalid).is_none());
+        }
+        assert!(list_items(&serde_json::json!({"error":"bad request"})).is_none());
+        assert_eq!(
+            list_items(&serde_json::json!({"items":[]})).unwrap().len(),
+            0
+        );
+    }
 
     #[test]
     fn oauth_requests_user_scopes_and_validates_state_before_exchange() {

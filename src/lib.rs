@@ -5,6 +5,7 @@ pub mod discord_commands;
 pub mod oauth_callback;
 pub mod pause;
 pub mod problem_help;
+pub mod recommendation;
 pub mod reminder;
 pub mod settings;
 pub mod solved_ac;

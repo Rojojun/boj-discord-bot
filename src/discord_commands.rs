@@ -1,6 +1,7 @@
 use crate::account_link::AccountLinks;
 use crate::curriculum::{CurriculumStore, Plan};
 use crate::pause::{PauseError, PauseStatus, PauseStore};
+use crate::recommendation::{Recommendation, RecommendationStore};
 use crate::settings::{
     LookupError, Profile, ProfileLookup, Settings, SettingsError, SettingsStore, SettingsUpdate,
 };
@@ -16,6 +17,7 @@ pub struct Commands {
     api: Option<SolvedAc>,
     links: AccountLinks,
     redirect: Option<String>,
+    recommendations: RecommendationStore,
 }
 
 const STORAGE_ERROR: &str =
@@ -31,6 +33,7 @@ impl Commands {
             api,
             links: AccountLinks::new(data),
             redirect: None,
+            recommendations: RecommendationStore::new(data),
         }
     }
 
@@ -79,30 +82,52 @@ impl Commands {
                  `/curriculum track:cache` — 캐시 구현 트랙 선택\n\
                  `/skip days:1` — 1~7일 쉬기\n\
                  `/resume` — 학습 재개\n\
-                 `/today` — 오늘 과제 연결 상태 확인\n\n\
+                 `/today` — 현재 티어·트랙에 맞는 오늘의 추천 문제\n\n\
                  **현재 연결 상태**\nsolved.ac 앱: {}\n\
-                 신규 문제 배정·풀이 확인·자동 DM·AI 도움은 아직 연결 중입니다. 알림 시각 저장만으로 DM이 시작되지는 않습니다.",
-                if self.api.is_some() { "설정됨 (실호출은 /setup으로 확인)" } else { "미설정" }
+                 `/today`는 OAuth 없이 앱 인증으로 조회한 추천입니다. 이미 푼 문제 여부는 확인하지 않습니다. 풀이 확인·자동 DM·AI 도움은 아직 연결 중입니다.",
+                if self.api.is_some() {
+                    "설정됨 (실호출은 /setup으로 확인)"
+                } else {
+                    "미설정"
+                }
             ),
             "connect" => {
-                let Some(api) = &self.api else { return API_REQUIRED.into() };
-                let Some(redirect) = &self.redirect else { return "관리자가 SOLVED_AC_REDIRECT_URI와 콜백 서버를 설정해야 합니다.".into() };
+                let Some(api) = &self.api else {
+                    return API_REQUIRED.into();
+                };
+                let Some(redirect) = &self.redirect else {
+                    return "관리자가 SOLVED_AC_REDIRECT_URI와 콜백 서버를 설정해야 합니다.".into();
+                };
                 match self.links.begin(user, redirect, api) {
-                    Ok(url) => format!("[solved.ac 계정 연결하기]({url})\n10분 안에 인증해주세요. 본인에게만 보이는 링크이며 다른 사람에게 전달하지 마세요. 봇이 재시작되면 /connect를 다시 실행하세요."),
+                    Ok(url) => format!(
+                        "[solved.ac 계정 연결하기]({url})\n10분 안에 인증해주세요. 본인에게만 보이는 링크이며 다른 사람에게 전달하지 마세요. 봇이 재시작되면 /connect를 다시 실행하세요."
+                    ),
                     Err(_) => "연결 링크 생성에 실패했습니다. 잠시 후 다시 시도하세요.".into(),
                 }
             }
             "account" => match self.links.account(user) {
-                Ok(account) => format!("연결된 solved.ac 핸들: {}\n계정 ID: {}\n다른 계정으로 연결하려면 /connect를 실행하세요.", account.handle, account.id),
+                Ok(account) => format!(
+                    "연결된 solved.ac 핸들: {}\n계정 ID: {}\n다른 계정으로 연결하려면 /connect를 실행하세요.",
+                    account.handle, account.id
+                ),
                 Err(_) => "연결된 계정을 읽을 수 없습니다. /connect로 계정을 연결해주세요.".into(),
             },
             "setup" => {
-                let Some(api) = &self.api else { return API_REQUIRED.into() };
-                let Some(handle) = string(options, "handle") else { return "solved.ac 핸들을 입력하세요.".into() };
+                let Some(api) = &self.api else {
+                    return API_REQUIRED.into();
+                };
+                let Some(handle) = string(options, "handle") else {
+                    return "solved.ac 핸들을 입력하세요.".into();
+                };
                 let count = integer(options, "count").unwrap_or(1);
-                let Ok(count) = u8::try_from(count) else { return "하루 문제 수는 1~10개입니다.".into() };
+                let Ok(count) = u8::try_from(count) else {
+                    return "하루 문제 수는 1~10개입니다.".into();
+                };
                 match self.settings.setup(user, handle, count, api) {
-                    Ok(settings) => format!("설정 완료!\n{}\n신규 문제 추천은 solved.ac 계정 인증·검색 연결 후 사용할 수 있습니다.", describe(&settings)),
+                    Ok(settings) => format!(
+                        "설정 완료!\n{}\n/today로 오늘의 추천을 받으세요. 이미 푼 문제 여부는 확인하지 않습니다.",
+                        describe(&settings)
+                    ),
                     Err(error) => settings_error(error),
                 }
             }
@@ -121,17 +146,34 @@ impl Commands {
                     Ok(value) => value,
                     Err(_) => return "하루 문제 수는 1~10개입니다.".into(),
                 };
-                match self.settings.update(user, SettingsUpdate { daily_count, reminder_time: reminder, ..Default::default() }, &NoProfileLookup) {
-                    Ok(settings) => format!("설정 변경 완료.\n{}\n자동 DM은 아직 연결 중입니다.", describe(&settings)),
+                match self.settings.update(
+                    user,
+                    SettingsUpdate {
+                        daily_count,
+                        reminder_time: reminder,
+                        ..Default::default()
+                    },
+                    &NoProfileLookup,
+                ) {
+                    Ok(settings) => format!(
+                        "설정 변경 완료.\n{}\n자동 DM은 아직 연결 중입니다.",
+                        describe(&settings)
+                    ),
                     Err(error) => settings_error(error),
                 }
             }
             "skip" => {
                 let days = integer(options, "days").unwrap_or(1);
-                let Ok(days) = u8::try_from(days) else { return "스킵 기간은 1~7일입니다.".into() };
+                let Ok(days) = u8::try_from(days) else {
+                    return "스킵 기간은 1~7일입니다.".into();
+                };
                 match self.pause.skip(user, now, Some(days)) {
-                    Ok(PauseStatus::SkippedUntil(date)) => format!("한국 시간 {date} 전까지 학습을 쉽니다. /resume으로 언제든 재개할 수 있습니다. 기간이 끝나도 재개 전까지 정지 상태를 유지합니다."),
-                    Ok(_) => "학습 정지 상태를 저장했습니다. /resume으로 재개할 수 있습니다.".into(),
+                    Ok(PauseStatus::SkippedUntil(date)) => format!(
+                        "한국 시간 {date} 전까지 학습을 쉽니다. /resume으로 언제든 재개할 수 있습니다. 기간이 끝나도 재개 전까지 정지 상태를 유지합니다."
+                    ),
+                    Ok(_) => {
+                        "학습 정지 상태를 저장했습니다. /resume으로 재개할 수 있습니다.".into()
+                    }
                     Err(PauseError::InvalidDays) => "스킵 기간은 1~7일입니다.".into(),
                     Err(PauseError::Storage(_)) => STORAGE_ERROR.into(),
                 }
@@ -142,17 +184,29 @@ impl Commands {
             },
             "curriculum" => {
                 if let Some(track) = string(options, "track")
-                    && self.curriculum.select(user, (track != "tier").then_some(track)).is_err() {
-                        return "트랙 저장 실패. cache, coding-interview, tier 중 선택해주세요.".into();
+                    && self
+                        .curriculum
+                        .select(user, (track != "tier").then_some(track))
+                        .is_err()
+                {
+                    return "트랙 저장 실패. cache, coding-interview, tier 중 선택해주세요.".into();
                 }
                 match self.curriculum.plan(user) {
-                    Ok(Plan::General) => "일반 티어 추천 모드입니다. 트랙: cache(캐시 구현), coding-interview(코딩면접), tier(일반). 신규 배정은 아직 연결 중입니다.".into(),
-                    Ok(Plan::Learning { key, stage }) => format!("트랙: {}\n현재 단계: {}\n완료 기준: 해당 단계 문제 {}개 풀이 확인\n신규 배정·풀이 확인은 아직 연결 중입니다.", key.track, stage.concept, stage.required),
+                    Ok(Plan::General) => "일반 티어 추천 모드입니다. 트랙: cache(캐시 구현), coding-interview(코딩면접), tier(일반). /today로 추천을 조회하세요. 변경한 트랙은 다음 신규 추천부터 적용됩니다.".into(),
+                    Ok(Plan::Learning { key, stage }) => format!("트랙: {}\n현재 단계: {}\n완료 기준: 해당 단계 문제 {}개 풀이 확인\n/today에서 단계 태그에 맞는 문제를 추천합니다. 변경은 다음 신규 추천부터 적용됩니다. 풀이 확인과 자동 단계 진행은 아직 연결 중입니다.", key.track, stage.concept, stage.required),
                     Ok(Plan::Completed { track }) => format!("{track} 트랙 완료! 다른 트랙 또는 tier를 선택하세요."),
                     Err(_) => STORAGE_ERROR.into(),
                 }
             }
-            "today" => "신규 문제 배정은 아직 사용할 수 없습니다. solved.ac 사용자 OAuth 인증과 미해결 문제 검색 연결을 구현 중입니다. /setup은 핸들과 학습 설정만 저장하며 계정 인증을 대신하지 않습니다.".into(),
+            "today" => {
+                let Some(api) = &self.api else {
+                    return API_REQUIRED.into();
+                };
+                match self.recommendations.today(user, now, &self.settings, api) {
+                    Ok(recommendation) => describe_recommendation(&recommendation),
+                    Err(message) => message,
+                }
+            }
             _ => "알 수 없는 명령입니다. /help를 확인해주세요.".into(),
         }
     }
@@ -170,6 +224,34 @@ fn describe(settings: &Settings) -> String {
         "핸들: {}\n티어: {}\n하루 문제 수: {}\n알림 시각: {} (한국 시간)",
         settings.solved_ac_handle, settings.tier, settings.daily_count, settings.reminder_time
     )
+}
+
+fn describe_recommendation(recommendation: &Recommendation) -> String {
+    let mut lines = vec![format!(
+        "**오늘의 추천 문제** · {} · 현재 티어 {}",
+        recommendation.handle, recommendation.tier
+    )];
+    if let Some(topic) = &recommendation.topic {
+        lines.push(format!("학습 주제: {topic}"));
+    }
+    lines.push("OAuth 미사용: 이미 푼 문제 여부는 확인하지 않았습니다. 같은 날에는 저장된 추천을 보여줍니다.".into());
+    let count = recommendation.problems.len();
+    for (index, problem) in recommendation.problems.iter().enumerate() {
+        let line = format!(
+            "{}. {}\n<{}>",
+            index + 1,
+            problem.title,
+            problem.submission_url
+        );
+        lines.push(line);
+    }
+    if count < usize::from(recommendation.requested) {
+        lines.push(format!(
+            "요청 {}개 중 {}개 추천: 조회한 후보에서 조건에 맞는 문제가 부족합니다.",
+            recommendation.requested, count
+        ));
+    }
+    lines.join("\n")
 }
 
 fn settings_error(error: SettingsError) -> String {
@@ -247,6 +329,6 @@ pub fn definitions() -> Vec<CreateCommand> {
                     .add_string_choice("LRU·LFU 캐시 구현", "cache")
                     .add_string_choice("코딩 기술면접", "coding-interview"),
             ),
-        CreateCommand::new("today").description("오늘 문제 배정 연결 상태 안내 (현재 연결 중)"),
+        CreateCommand::new("today").description("오늘의 티어·주제별 추천 (풀이 여부 미확인)"),
     ]
 }
