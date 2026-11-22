@@ -10,3 +10,4 @@ pub mod recommendation;
 pub mod reminder;
 pub mod settings;
 pub mod solved_ac;
+pub mod verification;

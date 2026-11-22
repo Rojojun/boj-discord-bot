@@ -43,6 +43,7 @@ sudo nano /etc/boj-discord-bot/bot.env
 `DISCORD_BOT_TOKEN`에 재발급한 토큰을 넣는다. 예시의 서버와 채널 ID가 맞는지 확인한다.
 `/setup`을 사용하려면 `SOLVED_AC_CLIENT_ID`와 `SOLVED_AC_CLIENT_SECRET`도 서버 환경변수 파일에 추가한다. 두 값이 없으면 다른 명령은 실행하고 `/setup`은 설정 안내를 반환한다.
 OAuth 연결에는 `SOLVED_AC_REDIRECT_URI`를 추가한다. 수신 주소는 `127.0.0.1:8787/oauth/callback`이며 HTTPS 프록시를 거쳐 등록 주소에 연결한다. 이 경로의 접근 로그에 쿼리를 기록하지 않는다. 프록시 설정은 호스트 주소에 맞춰 별도로 해야 한다. `/connect` 인증 후 `/account`로 연결을 확인한다.
+계정 연결이 확인되면 `/today` → `/check`로 실제 풀이 상태를 조회한다. 기존 인증값과 OAuth 세션은 업데이트 시 보존한다. `/status`에서 직접 체크와 API 조회 결과를 구분해 볼 수 있다. 채널 알림은 아직 `/done` 체크 기준이다.
 실제 토큰은 서버 설정 파일에만 저장하고 소스나 배포 압축에 넣지 않는다.
 로컬에서 실행하던 봇을 Ctrl+C로 종료한 후 서버 서비스를 시작한다.
 

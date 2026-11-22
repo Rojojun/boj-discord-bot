@@ -1,4 +1,4 @@
-use crate::account_link::AccountLinks;
+use crate::account_link::{AccountLinks, LinkError};
 use crate::checkin::{CheckinError, Checkins, Progress};
 use crate::curriculum::{CurriculumStore, Plan};
 use crate::pause::{PauseError, PauseStatus, PauseStore};
@@ -7,6 +7,9 @@ use crate::settings::{
     LookupError, Profile, ProfileLookup, Settings, SettingsError, SettingsStore, SettingsUpdate,
 };
 use crate::solved_ac::SolvedAc;
+use crate::verification::{
+    OAuthSolves, PendingReason, Report, Verifications, VerifiedStatus, VerifyError,
+};
 use chrono::{DateTime, Utc};
 use serenity::all::{CommandDataOption, CommandOptionType, CreateCommand, CreateCommandOption};
 use std::path::Path;
@@ -20,6 +23,7 @@ pub struct Commands {
     redirect: Option<String>,
     recommendations: RecommendationStore,
     checkins: Checkins,
+    verifications: Verifications,
 }
 
 const STORAGE_ERROR: &str =
@@ -37,6 +41,7 @@ impl Commands {
             redirect: None,
             recommendations: RecommendationStore::new(data),
             checkins: Checkins::new(data),
+            verifications: Verifications::new(data),
         }
     }
 
@@ -76,10 +81,39 @@ impl Commands {
         now: DateTime<Utc>,
     ) -> String {
         match name {
+            "check" => {
+                let Some(api) = &self.api else { return API_REQUIRED.into() };
+                match self.checkins.progress(user, now) {
+                    Ok(None) => return "먼저 /today로 오늘 추천 문제를 받아주세요.".into(),
+                    Err(_) => return STORAGE_ERROR.into(),
+                    _ => {},
+                }
+                let account = match self.links.account(user) {
+                    Ok(account) => account,
+                    Err(_) => return "/connect로 본인 solved.ac 계정을 먼저 연결해주세요.".into(),
+                };
+                let tokens = match self.links.tokens_for(user, account.id, api) {
+                    Ok(tokens) => tokens,
+                    Err(LinkError::Storage(_)) => return STORAGE_ERROR.into(),
+                    Err(LinkError::Api(crate::solved_ac::ApiError::RateLimited { .. })) => return "solved.ac 요청 제한으로 토큰 갱신을 확인하지 못했습니다. 잠시 후 /check를 다시 실행하고, 재연결 안내가 나오면 /connect를 진행해주세요.".into(),
+                    Err(_) => return "계정 인증을 갱신하지 못했습니다. /connect로 다시 연결해주세요. 기존 체크 기록은 유지됩니다.".into(),
+                };
+                match self.verifications.check(user, now, &OAuthSolves { api, tokens, account_id: account.id }) {
+                    Ok(report) => {
+                        let manual = self.checkins.progress(user, now).ok().flatten().map(|p| format!("직접 체크: {}/{} (별도 기록)", p.count(), p.total())).unwrap_or_default();
+                        format!("{}\n\n{}\n채널 알림은 현재 /done 직접 체크를 기준으로 동작합니다.", describe_report(&report), manual)
+                    },
+                    Err(VerifyError::NoRecommendation) => "먼저 /today로 오늘 추천 문제를 받아주세요.".into(),
+                    Err(VerifyError::WrongAccount) => "오늘 추천을 받은 핸들과 OAuth 연결 계정이 다릅니다. /account로 계정을 확인하고 오늘 추천 핸들의 계정으로 /connect를 진행해주세요. 기존 추천과 직접 체크는 바꾸지 않았습니다.".into(),
+                    Err(VerifyError::Api(crate::solved_ac::ApiError::Permission)) => "solved.ac 앱 인증 또는 사용자 권한이 거부됐습니다. 서버 앱 설정을 확인하고 /connect에서 풀이 조회 권한을 다시 승인해주세요.".into(),
+                    Err(VerifyError::Api(_)) => "계정 소유 확인에 실패했습니다. 잠시 후 다시 시도해주세요. 기존 기록은 유지됩니다.".into(),
+                    Err(VerifyError::Storage(_)) => STORAGE_ERROR.into(),
+                }
+            }
             "start" => match self.settings.read(user) {
                 Ok(None) => "**코테-마타-봇 시작하기**\n내 수준에 맞는 연습 문제를 매일 추천받으세요.\n\n1. solved.ac 프로필에서 본인의 아이디(핸들)를 확인하세요. Discord 닉네임과는 다릅니다.\n2. `/setup`을 선택하고 `handle`에 그 아이디, `count`에 하루 문제 수를 넣으세요. 처음에는 1~3개를 추천합니다.\n3. `/today`로 추천을 받고, 풀었으면 `/done`으로 체크하세요.\n\n추천 문제는 이미 푼 문제일 수도 있습니다. 지금은 별도의 계정 인증 없이 시작할 수 있습니다.".into(),
                 Ok(Some(settings)) => match self.pause.current(user, now) {
-                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n이미 푼 문제 여부와 완료 상태는 아직 자동 확인하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
+                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n계정을 연결했다면 /check로 실제 풀이 상태를 조회하세요. 이미 푼 문제 제외와 백그라운드 자동 확인은 아직 지원하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
                     Ok(_) => "**지금은 학습을 쉬고 있습니다.**\n다시 시작하려면 `/resume` → `/today` 순서로 실행하세요.\n내 설정은 `/settings`에서 확인할 수 있습니다.".into(),
                     Err(_) => STORAGE_ERROR.into(),
                 },
@@ -100,7 +134,11 @@ impl Commands {
                 }
             }
             "status" => match self.checkins.progress(user, now) {
-                Ok(Some(progress)) => describe_progress(&progress),
+                Ok(Some(progress)) => match self.verifications.read(user, now) {
+                    Ok(Some(report)) => format!("{}\n\n{}\n최신 풀이 상태는 /check로 다시 조회하세요.", describe_progress(&progress), describe_report(&report)),
+                    Ok(None) => format!("{}\n\n계정을 연결했다면 /check로 실제 풀이 상태를 확인할 수 있습니다.", describe_progress(&progress)),
+                    Err(_) => format!("{}\n\n저장된 API 확인 결과를 읽지 못했습니다.", describe_progress(&progress)),
+                },
                 Ok(None) => "아직 오늘 추천이 없습니다. /today로 문제를 받아주세요. 오늘 추천을 받지 않은 사람에게는 알림을 보내지 않습니다.".into(),
                 Err(_) => STORAGE_ERROR.into(),
             },
@@ -113,7 +151,8 @@ impl Commands {
                  `/today` — 오늘 추천 문제와 풀이할 사이트 링크\n\
                  `/done` — 오늘 추천 전체를 직접 완료 체크\n\
                  `/done problem:1` — 1번만 체크 · `undo:true`로 취소\n\
-                 `/status` — 오늘의 직접 체크 현황\n\
+                 `/status` — 직접 체크와 저장된 API 조회 결과\n\
+                 `/check` — 연결 계정의 실제 풀이 상태 조회\n\
                  `/settings` — 내 설정 조회\n\
                  `/settings count:2` — 하루 문제 수 변경\n\
                  `/skip days:1` — 1~7일 쉬기\n\
@@ -121,9 +160,9 @@ impl Commands {
                  \n**선택 기능**\n\
                  `/curriculum` — 트랙 조회·선택 (캐시 구현/코딩면접/일반)\n\
                  `/settings reminder:21:00` — 미체크 채널 알림 시각 (한국 시간, 기본 21:00)\n\
-                 `/connect`, `/account` — 계정 인증·연결 확인 (현재 추천에는 불필요)\n\n\
+                 `/connect`, `/account` — /check를 위한 계정 인증·연결 확인\n\n\
                  오늘 추천을 받은 뒤 체크가 남아 있으면 설정 시각 이후 이 채널에서 하루 한 번 멘션합니다. 쉬는 사람은 제외합니다.\n\
-                 체크는 자기 신고입니다. 실제 풀이 자동 확인·이미 푼 문제 제외·DM·AI 도움은 아직 미지원입니다.",
+                 /done은 자기 신고, /check는 API 조회입니다. 알림은 아직 /done 기준입니다. 이미 푼 문제 제외·백그라운드 풀이 확인·DM·AI 도움은 아직 미지원입니다.",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -266,6 +305,56 @@ fn describe(settings: &Settings) -> String {
     )
 }
 
+fn describe_report(report: &Report) -> String {
+    let solved = report
+        .results
+        .iter()
+        .filter(|row| row.status == VerifiedStatus::Solved)
+        .count();
+    let pending = report
+        .results
+        .iter()
+        .filter(|row| row.status == VerifiedStatus::Pending)
+        .count();
+    let checked_at = report
+        .checked_at
+        .with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).expect("Seoul offset"));
+    let mut lines = vec![format!(
+        "**실제 풀이 조회: {}/{} 해결 · {}개 확인 대기**\n대상: {} · {} 추천\n조회 시각: {} (한국 시간)",
+        solved,
+        report.results.len(),
+        pending,
+        report.handle,
+        report.date,
+        checked_at.format("%Y-%m-%d %H:%M:%S")
+    )];
+    for (index, row) in report.results.iter().enumerate() {
+        let label = match row.status {
+            VerifiedStatus::Solved => "✅ 해결 확인",
+            VerifiedStatus::Unsolved => "⬜ 미완료 확인",
+            VerifiedStatus::Pending => match row.reason {
+                Some(PendingReason::Permission) => "❔ 권한 확인 필요 (/connect)",
+                Some(PendingReason::RateLimited) => "❔ 요청 제한 · 나중에 재조회",
+                Some(PendingReason::Unavailable) => "❔ 외부 조회 실패",
+                Some(PendingReason::NotFound) => "❔ 문제 상세를 찾지 못함",
+                Some(PendingReason::InvalidResponse) => "❔ 응답 형식 확인 필요",
+                _ => "❔ 상태 미제공 · 풀이 여부 미확정",
+            },
+        };
+        lines.push(format!("{}. {} — {}", index + 1, row.problem.title, label));
+        if row.status == VerifiedStatus::Pending
+            && let Some(previous) = row.last_confirmed_solved_at
+        {
+            lines.push(format!(
+                "   이전 해결 확인: {} UTC (이번 조회에서는 미확정)",
+                previous.format("%Y-%m-%d %H:%M:%S")
+            ));
+        }
+    }
+    lines.push("solved.ac에 반영된 해결 상태 기준입니다. 오늘 새로 제출했는지까지 증명하지는 않습니다. 확인 대기는 미완료로 단정하지 않습니다.".into());
+    lines.join("\n")
+}
+
 fn describe_progress(progress: &Progress) -> String {
     let mut lines = vec![format!(
         "**오늘 직접 완료 체크: {}/{}**",
@@ -380,6 +469,7 @@ pub fn definitions() -> Vec<CreateCommand> {
                 "true면 선택한 완료 체크 취소",
             )),
         CreateCommand::new("status").description("오늘의 직접 완료 체크 현황"),
+        CreateCommand::new("check").description("OAuth 연결 계정으로 오늘 추천 문제 풀이 조회"),
         CreateCommand::new("connect").description("내 solved.ac 계정 OAuth 연결"),
         CreateCommand::new("account").description("연결된 solved.ac 계정 조회"),
         CreateCommand::new("setup")

@@ -133,7 +133,24 @@ impl SolvedAc {
         decode(self.request("GET", &endpoint(&["me"]), Some(tokens)).call())
     }
 
+    pub fn user_account(&self, handle: &str) -> Result<Account, ApiError> {
+        decode(
+            self.request("GET", &endpoint(&["users", handle]), None)
+                .call(),
+        )
+    }
+
     pub fn solved(&self, tokens: &Tokens, problem_id: u64, sub: &str) -> Result<bool, ApiError> {
+        self.solve_status(tokens, problem_id, sub)?
+            .ok_or(ApiError::Permission)
+    }
+
+    pub fn solve_status(
+        &self,
+        tokens: &Tokens,
+        problem_id: u64,
+        sub: &str,
+    ) -> Result<Option<bool>, ApiError> {
         if !tokens.permits_solves() {
             return Err(ApiError::Permission);
         }
@@ -142,15 +159,7 @@ impl SolvedAc {
             url.query_pairs_mut().append_pair("sub", sub);
         }
         let body: serde_json::Value = decode(self.request("GET", &url, Some(tokens)).call())?;
-        match body.get("userStatus") {
-            Some(serde_json::Value::String(status)) if status == "solved" => Ok(true),
-            Some(serde_json::Value::String(status)) if status == "partial" || status == "tried" => {
-                Ok(false)
-            }
-            // A null response still needs real-account validation against anonymous responses.
-            Some(serde_json::Value::Null) => Err(ApiError::Permission),
-            _ => Err(ApiError::InvalidResponse),
-        }
+        Ok(parse_solve_status(&body))
     }
 
     fn token(&self, fields: &[(&str, &str)]) -> Result<Tokens, ApiError> {
@@ -172,6 +181,15 @@ impl SolvedAc {
             }
             None => request,
         }
+    }
+}
+
+fn parse_solve_status(body: &serde_json::Value) -> Option<bool> {
+    match body.get("userStatus").and_then(serde_json::Value::as_str) {
+        Some("solved") => Some(true),
+        Some("partial" | "tried") => Some(false),
+        // Null, missing and unknown values never prove that a problem is unsolved.
+        _ => None,
     }
 }
 
@@ -424,6 +442,28 @@ fn decode<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solve_state_requires_an_explicit_known_status() {
+        for (status, expected) in [
+            ("solved", Some(true)),
+            ("tried", Some(false)),
+            ("partial", Some(false)),
+            ("new-status", None),
+        ] {
+            assert_eq!(
+                parse_solve_status(&serde_json::json!({"userStatus":status})),
+                expected
+            );
+        }
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"userStatus":null}),
+            serde_json::json!({"userStatus":{"solved":true}}),
+        ] {
+            assert_eq!(parse_solve_status(&body), None);
+        }
+    }
 
     #[test]
     fn observed_v4_list_without_links_loads_only_selected_problem_detail() {
