@@ -5,6 +5,25 @@ use boj_discord_bot::{
 use serenity::all::CommandDataOption;
 
 struct Profiles;
+
+#[test]
+fn goal_fallback_only_proposes_tracks_and_preserves_pause_and_progress() {
+    let data = tempfile::tempdir().unwrap();
+    let commands = Commands::new(data.path(), None);
+    let now = std::time::SystemTime::now().into();
+    commands.execute(1, "skip", &[], now);
+    let pause = data.path().join("users/1/pause.json");
+    let before = std::fs::read(&pause).unwrap();
+    let response = commands.execute(
+        1,
+        "goal",
+        &[option("text", 3, "LRU와 LFU 배우기".into())],
+        now,
+    );
+    assert!(response.contains("/curriculum track:cache"));
+    assert_eq!(std::fs::read(pause).unwrap(), before);
+    assert!(!data.path().join("users/1/curriculum.json").exists());
+}
 impl ProfileLookup for Profiles {
     fn lookup(&self, handle: &str) -> Result<Profile, LookupError> {
         Ok(Profile {

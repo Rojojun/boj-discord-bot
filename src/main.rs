@@ -1,4 +1,5 @@
 use boj_discord_bot::{
+    agy::AgyClient,
     discord_commands::{self, Commands},
     solved_ac::SolvedAc,
 };
@@ -162,6 +163,12 @@ impl EventHandler for Handler {
         } else {
             EditInteractionResponse::new().content(text)
         };
+        let response = response.allowed_mentions(
+            CreateAllowedMentions::new()
+                .all_users(false)
+                .all_roles(false)
+                .everyone(false),
+        );
         if command.edit_response(&ctx.http, response).await.is_err() {
             eprintln!("명령 응답 전송 실패. Discord 연결 상태를 확인하세요.");
         }
@@ -214,6 +221,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let data = PathBuf::from(env::var("BOT_DATA_DIR").unwrap_or_else(|_| "data".into()));
     std::fs::create_dir_all(&data)?;
     let mut commands = Commands::new(&data, api);
+    let ai_socket = env::var("AGY_SOCKET").unwrap_or_else(|_| "/run/boj-ai/worker.sock".into());
+    if !ai_socket.trim().is_empty() {
+        commands = commands.with_agy(AgyClient::new(PathBuf::from(ai_socket)));
+    }
     let redirect = env::var("SOLVED_AC_REDIRECT_URI")
         .ok()
         .filter(|value| !value.trim().is_empty());

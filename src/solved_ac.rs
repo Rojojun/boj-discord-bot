@@ -140,6 +140,22 @@ impl SolvedAc {
         )
     }
 
+    pub fn tagged_problem(&self, problem: &Problem) -> Result<Candidate, ApiError> {
+        let (id, sub) = problem.id.split_once(':').unwrap_or((&problem.id, ""));
+        let id = id.parse::<u64>().map_err(|_| ApiError::InvalidResponse)?;
+        let mut url = endpoint(&["problems", &id.to_string()]);
+        if !sub.is_empty() {
+            url.query_pairs_mut().append_pair("sub", sub);
+        }
+        let body: serde_json::Value = decode(self.request("GET", &url, None).call())?;
+        if body.get("problemId").and_then(serde_json::Value::as_u64) != Some(id) {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut candidate = parse_metadata(&body).ok_or(ApiError::InvalidResponse)?;
+        candidate.problem = problem.clone();
+        Ok(candidate)
+    }
+
     pub fn solved(&self, tokens: &Tokens, problem_id: u64, sub: &str) -> Result<bool, ApiError> {
         self.solve_status(tokens, problem_id, sub)?
             .ok_or(ApiError::Permission)

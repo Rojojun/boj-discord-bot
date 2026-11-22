@@ -1,0 +1,30 @@
+[Unit]
+Description=Isolated Antigravity learning advisor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=bojai
+Group=bojbot
+Environment=HOME=/var/lib/boj-ai
+EnvironmentFile=/etc/boj-ai/worker.env
+WorkingDirectory=/var/lib/boj-ai/work
+ExecStart=/usr/bin/python3 /opt/boj-discord-bot/agy-worker.py
+RuntimeDirectory=boj-ai
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectProc=invisible
+InaccessiblePaths=-/etc/boj-discord-bot -/var/lib/boj-discord-bot
+ReadWritePaths=/var/lib/boj-ai /run/boj-ai
+MemoryMax=768M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

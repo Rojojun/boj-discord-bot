@@ -1,8 +1,10 @@
 use crate::account_link::{AccountLinks, LinkError};
+use crate::agy::AgyClient;
 use crate::checkin::{CheckinError, Checkins, Notice, Progress, ReminderProgress};
-use crate::curriculum::{CurriculumStore, Plan};
+use crate::curriculum::{self, CurriculumStore, Plan, TRACKS};
 use crate::pause::{PauseError, PauseStatus, PauseStore};
-use crate::recommendation::{Recommendation, RecommendationStore};
+use crate::problem_help::{HelpAdvisor, HelpCandidate};
+use crate::recommendation::{Candidate, Recommendation, RecommendationSource, RecommendationStore};
 use crate::settings::{
     LookupError, Profile, ProfileLookup, Settings, SettingsError, SettingsStore, SettingsUpdate,
 };
@@ -24,6 +26,7 @@ pub struct Commands {
     recommendations: RecommendationStore,
     checkins: Checkins,
     verifications: Verifications,
+    agy: Option<AgyClient>,
 }
 
 const STORAGE_ERROR: &str =
@@ -42,7 +45,130 @@ impl Commands {
             recommendations: RecommendationStore::new(data),
             checkins: Checkins::new(data),
             verifications: Verifications::new(data),
+            agy: None,
         }
+    }
+
+    pub fn with_agy(mut self, client: AgyClient) -> Self {
+        self.agy = Some(client);
+        self
+    }
+
+    fn hint(&self, user: u64, now: DateTime<Utc>, index: usize) -> String {
+        let saved = match self.checkins.progress(user,now) {
+            Ok(Some(progress)) => progress.recommendation,
+            Ok(None) => return "오늘 저장된 추천이 없습니다. 다음 학습일에 /today로 추천을 받은 뒤 /hint를 사용하세요. 학습 중단 상태를 해제할 필요는 없습니다.".into(),
+            Err(_) => return STORAGE_ERROR.into(),
+        };
+        let Some(original) = index
+            .checked_sub(1)
+            .and_then(|index| saved.problems.get(index))
+        else {
+            return "/today에 표시된 문제 번호를 선택해주세요.".into();
+        };
+        let Some(api) = &self.api else {
+            return API_REQUIRED.into();
+        };
+        let original = match api.tagged_problem(original) {
+            Ok(original) => original,
+            Err(_) => {
+                return "문제 제목·태그 조회에 실패했습니다. 잠시 후 다시 시도해주세요.".into();
+            }
+        };
+        let mut candidates = Vec::new();
+        if original.level > 1
+            && !original.tags.is_empty()
+            && let Ok(account) = self.links.account(user)
+            && saved.verified_account_id.is_none_or(|id| id == account.id)
+            && let Ok(tokens) = self.links.tokens_for(user, account.id, api)
+        {
+            let source = LinkedRecommendations {
+                api,
+                tokens,
+                account_id: account.id,
+            };
+            if source.validate_handle(&saved.handle).is_ok() {
+                let tags: Vec<_> = original.tags.iter().map(String::as_str).collect();
+                if let Ok(found) = source.problems(original.level - 1, &tags, 10) {
+                    candidates = found
+                        .into_iter()
+                        .filter(|p| {
+                            p.level < original.level
+                                && !saved
+                                    .problems
+                                    .iter()
+                                    .any(|assigned| assigned.id == p.problem.id)
+                                && p.tags.iter().any(|tag| original.tags.contains(tag))
+                                && saved.topic.as_ref().is_none_or(|topic| {
+                                    TRACKS.iter().flat_map(|track| track.stages).any(|stage| {
+                                        stage.concept == topic
+                                            && p.tags
+                                                .iter()
+                                                .any(|tag| stage.tags.contains(&tag.as_str()))
+                                    })
+                                })
+                        })
+                        .take(10)
+                        .collect();
+                }
+            }
+        }
+        let choices: Vec<_> = candidates
+            .iter()
+            .map(|p: &Candidate| HelpCandidate {
+                id: &p.problem.id,
+                title: &p.problem.title,
+                tags: &p.tags,
+            })
+            .collect();
+        let advice = self.agy.as_ref().and_then(|agy| {
+            agy.advise(&original.problem.title, &original.tags, &choices, &choices)
+        });
+        let (concepts, prerequisite, alternative, label) = match advice {
+            Some(advice) => (
+                advice.concepts,
+                advice.prerequisite_id,
+                advice.alternative_id,
+                "agy 제목·태그 기반 학습 힌트",
+            ),
+            None => (
+                original
+                    .tags
+                    .iter()
+                    .map(|tag| format!("{tag}: 이 개념의 기본 연산과 적용 조건부터 복습해보세요."))
+                    .collect(),
+                candidates.first().map(|p| p.problem.id.clone()),
+                candidates.first().map(|p| p.problem.id.clone()),
+                "AI를 사용할 수 없어 태그·검증된 후보로 안내합니다",
+            ),
+        };
+        let mut lines = vec![
+            format!("**{} · {}번 {}**", label, index, original.problem.title),
+            "**선수 개념·접근 힌트**".into(),
+        ];
+        if concepts.is_empty() {
+            lines.push("표시할 선수 개념 정보가 부족합니다.".into());
+        }
+        for concept in concepts {
+            lines.push(format!("• {concept}"));
+        }
+        for (label, id) in [
+            ("선수 연습", prerequisite),
+            ("더 쉬운 대체 후보", alternative),
+        ] {
+            if let Some(candidate) =
+                id.and_then(|id| candidates.iter().find(|p| p.problem.id == id))
+            {
+                lines.push(format!(
+                    "**{}**: {}\n<{}>",
+                    label, candidate.problem.title, candidate.problem.submission_url
+                ));
+            } else {
+                lines.push(format!("**{label}**: 검증된 미해결 후보가 부족합니다."));
+            }
+        }
+        lines.push("제목·태그 기반 학습 제안입니다. 연습 링크를 열어도 오늘 추천·체크·커리큘럼은 변경되지 않습니다. 현재 대체 후보는 안내만 하며 슬롯 교체는 지원하지 않습니다.".into());
+        lines.join("\n")
     }
 
     pub fn with_redirect(mut self, redirect: String) -> Result<Self, std::io::Error> {
@@ -206,6 +332,15 @@ impl Commands {
         now: DateTime<Utc>,
     ) -> String {
         match name {
+            "goal" => {
+                let Some(goal)=string(options,"text") else { return "배우고 싶은 목표를 입력하세요. 예: LRU와 LFU를 배우고 싶어요".into() };
+                let suggested=self.agy.as_ref().and_then(|agy|curriculum::suggest(goal,agy));
+                match suggested {
+                    Some(track)=>format!("**추천 트랙: {}**\n{}\n적용하려면 `/curriculum track:{}`를 직접 선택하세요. 아직 목표나 진행 상태를 변경하지 않았습니다.",track.id,track.description,track.id),
+                    None=>"AI 제안을 만들지 못했거나 지원하는 트랙과 일치하지 않습니다. 직접 선택하세요:\n`/curriculum track:cache` — LRU·LFU 캐시 구현\n`/curriculum track:coding-interview` — 코딩 기술면접\n`/curriculum track:tier` — 일반 티어 추천\n기존 설정과 학습 중단 상태는 유지됩니다.".into(),
+                }
+            }
+            "hint" => self.hint(user,now,integer(options,"problem").and_then(|value|usize::try_from(value).ok()).unwrap_or(1)),
             "check" => {
                 let Some(api) = &self.api else { return API_REQUIRED.into() };
                 match self.checkins.progress(user, now) {
@@ -284,10 +419,12 @@ impl Commands {
                  `/resume` — 학습 재개\n\
                  \n**선택 기능**\n\
                  `/curriculum` — 트랙 조회·선택 (캐시 구현/코딩면접/일반)\n\
+                 `/goal text:LRU를 배우고 싶어요` — AI 트랙 제안 후 직접 확인\n\
+                 `/hint problem:1` — 선수 개념·쉬운 연습 후보 안내\n\
                  `/settings reminder:21:00` — 미체크 채널 알림 시각 (한국 시간, 기본 21:00)\n\
                  `/connect`, `/account` — /check를 위한 계정 인증·연결 확인\n\n\
                  오늘 추천을 받은 뒤 연결 계정은 미완료가 확인된 경우, 미연결 계정은 체크가 남은 경우 설정 시각 이후 하루 한 번 멘션합니다. 쉬는 사람과 확인 대기는 제외합니다.\n\
-                 /done은 자기 신고, /check는 API 조회입니다. 연결 계정 알림은 실제 풀이 조회, 미연결 계정 알림은 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 알림 전에 풀이를 자동 확인합니다. DM·AI 도움은 아직 미지원입니다.",
+                 /done은 자기 신고, /check는 API 조회입니다. 연결 계정 알림은 실제 풀이 조회, 미연결 계정 알림은 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 알림 전에 풀이를 자동 확인합니다. AI는 제목·태그 기반 학습 제안이며 장애 시 기본 안내로 전환합니다. DM과 추천 슬롯 교체는 아직 미지원입니다.",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -599,6 +736,28 @@ pub fn definitions() -> Vec<CreateCommand> {
             )),
         CreateCommand::new("status").description("오늘의 직접 완료 체크 현황"),
         CreateCommand::new("check").description("OAuth 연결 계정으로 오늘 추천 문제 풀이 조회"),
+        CreateCommand::new("goal")
+            .description("배우고 싶은 목표를 AI로 지원 트랙에 매칭 (제안만)")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "text",
+                    "예: LRU와 LFU를 배우고 싶어요",
+                )
+                .required(true)
+                .max_length(500),
+            ),
+        CreateCommand::new("hint")
+            .description("오늘 추천 문제의 선수 개념과 쉬운 연습 후보 안내")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "problem",
+                    "/today의 문제 번호 (기본 1번)",
+                )
+                .min_int_value(1)
+                .max_int_value(10),
+            ),
         CreateCommand::new("connect").description("내 solved.ac 계정 OAuth 연결"),
         CreateCommand::new("account").description("연결된 solved.ac 계정 조회"),
         CreateCommand::new("setup")

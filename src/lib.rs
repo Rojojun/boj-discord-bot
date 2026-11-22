@@ -1,4 +1,5 @@
 pub mod account_link;
+pub mod agy;
 pub mod assignment;
 pub mod checkin;
 pub mod curriculum;
