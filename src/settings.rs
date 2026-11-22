@@ -4,8 +4,18 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryMode {
+    #[default]
+    Channel,
+    Dm,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub delivery: DeliveryMode,
     pub solved_ac_handle: String,
     pub tier: String,
     pub daily_count: u8,
@@ -15,6 +25,7 @@ pub struct Settings {
 
 #[derive(Debug, Default)]
 pub struct SettingsUpdate<'a> {
+    pub delivery: Option<DeliveryMode>,
     pub handle: Option<&'a str>,
     pub daily_count: Option<u8>,
     pub reminder_time: Option<&'a str>,
@@ -53,6 +64,26 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
+    pub fn users(&self) -> io::Result<Vec<u64>> {
+        let entries = match fs::read_dir(&self.users) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut users = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if let Some(user) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u64>().ok())
+                && self.read(user)?.is_some()
+            {
+                users.push(user);
+            }
+        }
+        Ok(users)
+    }
     pub fn new(data_dir: &Path) -> Self {
         Self {
             users: data_dir.join("users"),
@@ -142,6 +173,7 @@ impl SettingsStore {
         let mut settings = match self.read(discord_id).map_err(SettingsError::Storage)? {
             Some(settings) => settings,
             None if setup => Settings {
+                delivery: DeliveryMode::Channel,
                 solved_ac_handle: String::new(),
                 tier: String::new(),
                 daily_count: 1,
@@ -156,6 +188,9 @@ impl SettingsStore {
         }
         if let Some(count) = update.daily_count {
             settings.daily_count = count;
+        }
+        if let Some(delivery) = update.delivery {
+            settings.delivery = delivery;
         }
         if let Some(time) = update.reminder_time {
             settings.reminder_time = time.into();

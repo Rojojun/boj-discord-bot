@@ -1,6 +1,7 @@
 use crate::{
     assignment::{Problem, seoul_time},
-    recommendation::Recommendation,
+    curriculum::CurriculumStore,
+    recommendation::{RECOMMENDATION_WRITES, Recommendation},
     solved_ac::{ApiError, SolvedAc, Tokens},
 };
 use chrono::{DateTime, NaiveDate, Utc};
@@ -80,6 +81,8 @@ pub struct ResultRow {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
+    #[serde(default)]
+    pub recommendation_revision: u64,
     pub date: NaiveDate,
     pub handle: String,
     pub account_id: u64,
@@ -106,7 +109,27 @@ impl Verifications {
             .join(format!("{date}.json"))
     }
     pub fn read(&self, user: u64, now: DateTime<Utc>) -> io::Result<Option<Report>> {
-        read(&self.path(user, seoul_time(now).date_naive()))
+        let date = seoul_time(now).date_naive();
+        let report: Option<Report> = read(&self.path(user, date))?;
+        let recommendation: Option<Recommendation> = read(
+            &self
+                .data
+                .join("users")
+                .join(user.to_string())
+                .join("recommendations")
+                .join(format!("{date}.json")),
+        )?;
+        Ok(report.filter(|report| {
+            recommendation.as_ref().is_some_and(|rec| {
+                rec.revision == report.recommendation_revision
+                    && rec.problems.len() == report.results.len()
+                    && rec
+                        .problems
+                        .iter()
+                        .zip(&report.results)
+                        .all(|(p, row)| p.id == row.problem.id)
+            })
+        }))
     }
     pub fn check(
         &self,
@@ -114,6 +137,9 @@ impl Verifications {
         now: DateTime<Utc>,
         source: &impl SolveSource,
     ) -> Result<Report, VerifyError> {
+        let _recommendation_guard = RECOMMENDATION_WRITES
+            .lock()
+            .map_err(|_| io::Error::other("recommendation lock poisoned"))?;
         let _guard = self
             .writes
             .lock()
@@ -140,7 +166,7 @@ impl Verifications {
             .filter(|report| report.account_id == account_id);
         let mut stopped: Option<PendingReason> = None;
         let mut results = Vec::new();
-        for problem in recommendation.problems {
+        for problem in recommendation.problems.iter().cloned() {
             let result = if let Some(reason) = &stopped {
                 Err(reason.clone())
             } else {
@@ -190,8 +216,9 @@ impl Verifications {
             });
         }
         let report = Report {
+            recommendation_revision: recommendation.revision,
             date,
-            handle: recommendation.handle,
+            handle: recommendation.handle.clone(),
             account_id,
             checked_at: now,
             results,
@@ -203,6 +230,17 @@ impl Verifications {
         serde_json::to_writer(&mut file, &report).map_err(io::Error::other)?;
         file.flush()?;
         file.as_file().sync_all()?;
+        if recommendation.verified_account_id == Some(account_id)
+            && let Some(stage) = &recommendation.stage
+        {
+            let solved: Vec<_> = report
+                .results
+                .iter()
+                .filter(|row| row.status == VerifiedStatus::Solved)
+                .map(|row| row.problem.id.as_str())
+                .collect();
+            CurriculumStore::new(&self.data).record_solved(user, stage, &solved)?;
+        }
         file.persist(path).map_err(|error| error.error)?;
         Ok(report)
     }

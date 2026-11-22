@@ -39,6 +39,7 @@ fn seed(data: &Path) {
     fs::write(
         user.join("settings.json"),
         serde_json::to_vec(&Settings {
+            delivery: Default::default(),
             solved_ac_handle: "updated-handle".into(),
             tier: "Gold V".into(),
             daily_count: 2,

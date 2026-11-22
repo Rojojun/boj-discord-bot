@@ -28,6 +28,33 @@ pub struct Authorization {
     expires: std::time::Instant,
 }
 
+pub trait AccountApi {
+    fn begin(&self, redirect: &str) -> io::Result<Authorization>;
+    fn exchange(&self, pending: Authorization, state: &str, code: &str)
+    -> Result<Tokens, ApiError>;
+    fn account(&self, tokens: &Tokens) -> Result<Account, ApiError>;
+    fn refresh(&self, token: &str) -> Result<Tokens, ApiError>;
+}
+impl AccountApi for SolvedAc {
+    fn begin(&self, redirect: &str) -> io::Result<Authorization> {
+        SolvedAc::begin(self, redirect)
+    }
+    fn exchange(
+        &self,
+        pending: Authorization,
+        state: &str,
+        code: &str,
+    ) -> Result<Tokens, ApiError> {
+        SolvedAc::exchange(self, pending, state, code)
+    }
+    fn account(&self, tokens: &Tokens) -> Result<Account, ApiError> {
+        SolvedAc::account(self, tokens)
+    }
+    fn refresh(&self, token: &str) -> Result<Tokens, ApiError> {
+        SolvedAc::refresh(self, token)
+    }
+}
+
 impl Authorization {
     pub(crate) fn matches(&self, state: &str) -> bool {
         state == self.state && std::time::Instant::now() < self.expires

@@ -31,6 +31,8 @@ fn seed(data: &Path, user: u64, date: &str) {
     let directory = data.join(format!("users/{user}/recommendations"));
     fs::create_dir_all(&directory).unwrap();
     let recommendation = Recommendation {
+        revision: 0,
+        stage: None,
         verified_account_id: None,
         handle: "alice".into(),
         tier: 10,
@@ -54,6 +56,7 @@ fn seed(data: &Path, user: u64, date: &str) {
 fn report(statuses: &[VerifiedStatus]) -> Report {
     let now = time("2026-11-21T12:00:00Z");
     Report {
+        recommendation_revision: 0,
         date: now.date_naive(),
         handle: "alice".into(),
         account_id: 100,

@@ -35,6 +35,44 @@ pub struct PauseStore {
 }
 
 impl PauseStore {
+    pub fn claim_prompt(&self, user: u64, now: DateTime<Utc>) -> io::Result<Option<NaiveDate>> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| io::Error::other("pause lock poisoned"))?;
+        let Some(mut pause) = read(&self.users, user)? else {
+            return Ok(None);
+        };
+        if pause.expires_on > seoul_time(now).date_naive() || pause.prompt_attempted {
+            return Ok(None);
+        }
+        pause.prompt_attempted = true;
+        self.write(user, &pause)?;
+        Ok(Some(pause.expires_on))
+    }
+    pub fn prompt_current(
+        &self,
+        user: u64,
+        expiry: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> io::Result<bool> {
+        Ok(
+            matches!(self.current(user,now)?,PauseStatus::AwaitingResume{expired_on} if expired_on==expiry),
+        )
+    }
+    pub fn retry_prompt(&self, user: u64, expiry: NaiveDate) -> io::Result<()> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| io::Error::other("pause lock poisoned"))?;
+        if let Some(mut pause) = read(&self.users, user)?
+            && pause.expires_on == expiry
+        {
+            pause.prompt_attempted = false;
+            self.write(user, &pause)?;
+        }
+        Ok(())
+    }
     pub fn current(&self, user: u64, now: DateTime<Utc>) -> io::Result<PauseStatus> {
         status(&self.users, user, seoul_time(now).date_naive())
     }

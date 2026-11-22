@@ -1,7 +1,7 @@
 //! Daily recommendations preserve whether an OAuth account's solve state was checked.
 use crate::{
     assignment::{Problem, seoul_time},
-    curriculum::{CurriculumStore, Plan},
+    curriculum::{CurriculumStore, Plan, StageKey},
     pause::{self, PauseStatus},
     settings::{ProfileLookup, SettingsStore},
 };
@@ -14,7 +14,7 @@ use std::{
     sync::Mutex,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub problem: Problem,
     pub level: u8,
@@ -34,6 +34,10 @@ pub trait RecommendationSource: ProfileLookup {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Recommendation {
     #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub stage: Option<StageKey>,
+    #[serde(default)]
     pub verified_account_id: Option<u64>,
     pub handle: String,
     pub tier: u8,
@@ -44,8 +48,8 @@ pub struct Recommendation {
 
 pub struct RecommendationStore {
     data: PathBuf,
-    writes: Mutex<()>,
 }
+pub(crate) static RECOMMENDATION_WRITES: Mutex<()> = Mutex::new(());
 
 impl RecommendationStore {
     pub fn existing(
@@ -70,10 +74,7 @@ impl RecommendationStore {
         .map_err(storage)
     }
     pub fn new(data: &Path) -> Self {
-        Self {
-            data: data.into(),
-            writes: Mutex::new(()),
-        }
+        Self { data: data.into() }
     }
 
     pub fn today(
@@ -105,12 +106,14 @@ impl RecommendationStore {
             .lookup(&settings.solved_ac_handle)
             .map_err(|_| "현재 티어 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")?;
         let tier: u8 = profile.tier.parse().ok().filter(|tier| (1..=30).contains(tier)).ok_or("현재 티어에 맞춘 추천이 불가능합니다. Unrated·Master 계정의 난이도 선택은 아직 지원하지 않습니다.")?;
-        let (topic, tags) = match CurriculumStore::new(&self.data)
+        let (stage_key, topic, tags) = match CurriculumStore::new(&self.data)
             .plan(user)
             .map_err(storage)?
         {
-            Plan::General => (None, &[][..]),
-            Plan::Learning { stage, .. } => (Some(stage.concept.to_owned()), stage.tags),
+            Plan::General => (None, None, &[][..]),
+            Plan::Learning { key, stage } => {
+                (Some(key), Some(stage.concept.to_owned()), stage.tags)
+            }
             Plan::Completed { .. } => return Err(
                 "커리큘럼을 완료했습니다. /curriculum으로 다른 트랙이나 일반 모드를 선택하세요."
                     .into(),
@@ -146,6 +149,8 @@ impl RecommendationStore {
             return Err("조회한 후보에서 현재 난이도·주제에 맞고 제출 링크가 있는 문제를 찾지 못했습니다. 다음 조회에서 다시 시도할 수 있습니다.".into());
         }
         let recommendation = Recommendation {
+            revision: 0,
+            stage: stage_key,
             verified_account_id: source.verified_account_id(),
             handle: profile.handle,
             tier,
@@ -153,7 +158,9 @@ impl RecommendationStore {
             topic,
             problems,
         };
-        let _guard = self.writes.lock().map_err(|_| "추천 저장 잠금 오류")?;
+        let _guard = RECOMMENDATION_WRITES
+            .lock()
+            .map_err(|_| "추천 저장 잠금 오류")?;
         active()?;
         if let Some(saved) = read(&path).map_err(storage)? {
             return Ok(saved);

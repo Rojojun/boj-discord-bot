@@ -1,4 +1,4 @@
-use crate::solved_ac::{Account, ApiError, Authorization, SolvedAc, Tokens};
+use crate::solved_ac::{Account, AccountApi, ApiError, Authorization, Tokens};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -18,6 +18,8 @@ pub enum LinkError {
 
 #[derive(Deserialize, Serialize)]
 struct LinkedAccount {
+    #[serde(default)]
+    refresh_after: Option<u64>,
     account: Account,
     tokens: Tokens,
     expires_at: u64,
@@ -38,7 +40,12 @@ impl AccountLinks {
         }
     }
 
-    pub fn begin(&self, user: u64, redirect: &str, client: &SolvedAc) -> Result<Url, LinkError> {
+    pub fn begin(
+        &self,
+        user: u64,
+        redirect: &str,
+        client: &impl AccountApi,
+    ) -> Result<Url, LinkError> {
         let authorization = client.begin(redirect).map_err(LinkError::Storage)?;
         let url = authorization.url.clone();
         self.pending
@@ -52,7 +59,7 @@ impl AccountLinks {
         &self,
         state: &str,
         code: &str,
-        client: &SolvedAc,
+        client: &impl AccountApi,
     ) -> Result<(u64, Account), LinkError> {
         let (user, authorization) = {
             let mut pending = self.pending.lock().map_err(lock_error)?;
@@ -80,6 +87,7 @@ impl AccountLinks {
         self.write(
             user,
             &LinkedAccount {
+                refresh_after: None,
                 account: stored_account,
                 expires_at: epoch()?.saturating_add(tokens.expires_in),
                 tokens,
@@ -92,7 +100,7 @@ impl AccountLinks {
         &self,
         user: u64,
         account_id: u64,
-        client: &SolvedAc,
+        client: &impl AccountApi,
     ) -> Result<Tokens, LinkError> {
         let _guard = self.writes.lock().map_err(lock_error)?;
         let file = File::open(self.path(user)).map_err(|error| {
@@ -112,6 +120,13 @@ impl AccountLinks {
         if linked.expires_at > now.saturating_add(30) {
             return Ok(linked.tokens);
         }
+        if let Some(after) = linked.refresh_after
+            && after > now
+        {
+            return Err(LinkError::Api(ApiError::RateLimited {
+                retry_after_seconds: Some(after - now),
+            }));
+        }
         let refresh = linked
             .tokens
             .refresh_token
@@ -119,7 +134,21 @@ impl AccountLinks {
             .ok_or(LinkError::ReconnectRequired)?;
         // A response can be lost after the server spends the token.
         self.write(user, &linked)?;
-        linked.tokens = client.refresh(&refresh).map_err(LinkError::Api)?;
+        linked.tokens = match client.refresh(&refresh) {
+            Ok(tokens) => tokens,
+            Err(ApiError::RateLimited {
+                retry_after_seconds,
+            }) => {
+                linked.tokens.refresh_token = Some(refresh);
+                linked.refresh_after = Some(now.saturating_add(retry_after_seconds.unwrap_or(60)));
+                self.write(user, &linked)?;
+                return Err(LinkError::Api(ApiError::RateLimited {
+                    retry_after_seconds,
+                }));
+            }
+            Err(error) => return Err(LinkError::Api(error)),
+        };
+        linked.refresh_after = None;
         if linked.tokens.refresh_token.is_none() || !linked.tokens.permits_solves() {
             return Err(LinkError::ReconnectRequired);
         }

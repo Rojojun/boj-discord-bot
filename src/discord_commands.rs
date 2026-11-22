@@ -6,7 +6,8 @@ use crate::pause::{PauseError, PauseStatus, PauseStore};
 use crate::problem_help::{HelpAdvisor, HelpCandidate};
 use crate::recommendation::{Candidate, Recommendation, RecommendationSource, RecommendationStore};
 use crate::settings::{
-    LookupError, Profile, ProfileLookup, Settings, SettingsError, SettingsStore, SettingsUpdate,
+    DeliveryMode, LookupError, Profile, ProfileLookup, Settings, SettingsError, SettingsStore,
+    SettingsUpdate,
 };
 use crate::solved_ac::{LinkedRecommendations, SolvedAc};
 use crate::verification::{
@@ -27,6 +28,7 @@ pub struct Commands {
     checkins: Checkins,
     verifications: Verifications,
     agy: Option<AgyClient>,
+    replacements: crate::replacement::Replacements,
 }
 
 const STORAGE_ERROR: &str =
@@ -46,6 +48,7 @@ impl Commands {
             checkins: Checkins::new(data),
             verifications: Verifications::new(data),
             agy: None,
+            replacements: crate::replacement::Replacements::new(data),
         }
     }
 
@@ -76,6 +79,7 @@ impl Commands {
             }
         };
         let mut candidates = Vec::new();
+        let mut candidate_owner = None;
         if original.level > 1
             && !original.tags.is_empty()
             && let Ok(account) = self.links.account(user)
@@ -88,6 +92,7 @@ impl Commands {
                 account_id: account.id,
             };
             if source.validate_handle(&saved.handle).is_ok() {
+                candidate_owner = Some(account.id);
                 let tags: Vec<_> = original.tags.iter().map(String::as_str).collect();
                 if let Ok(found) = source.problems(original.level - 1, &tags, 10) {
                     candidates = found
@@ -154,7 +159,7 @@ impl Commands {
         }
         for (label, id) in [
             ("선수 연습", prerequisite),
-            ("더 쉬운 대체 후보", alternative),
+            ("더 쉬운 대체 후보", alternative.clone()),
         ] {
             if let Some(candidate) =
                 id.and_then(|id| candidates.iter().find(|p| p.problem.id == id))
@@ -167,7 +172,19 @@ impl Commands {
                 lines.push(format!("**{label}**: 검증된 미해결 후보가 부족합니다."));
             }
         }
-        lines.push("제목·태그 기반 학습 제안입니다. 연습 링크를 열어도 오늘 추천·체크·커리큘럼은 변경되지 않습니다. 현재 대체 후보는 안내만 하며 슬롯 교체는 지원하지 않습니다.".into());
+        if let Some(candidate) =
+            alternative.and_then(|id| candidates.iter().find(|p| p.problem.id == id))
+            && let Some(owner) = candidate_owner
+        {
+            match self.replacements.offer(user,now,&saved,index,owner,candidate.clone()) {
+                Ok(code)=>lines.push(format!("오늘 {index}번을 이 후보로 교체하려면 `/replace offer:{code}`를 실행하세요. 30분 동안 유효하며 실행 시 풀이 상태를 다시 확인합니다.")),
+                Err(_)=>lines.push("교체 제안 저장에 실패했습니다. /hint로 다시 시도하세요.".into()),
+            }
+        }
+        lines.push(
+            "제목·태그 기반 학습 제안입니다. 연습 링크만 열면 오늘 추천은 변경되지 않습니다."
+                .into(),
+        );
         lines.join("\n")
     }
 
@@ -193,6 +210,42 @@ impl Commands {
         self.api
             .as_ref()
             .is_some_and(|api| self.links.complete(state, code, api).is_ok())
+    }
+
+    fn curriculum_summary(&self, user: u64) -> String {
+        match self.curriculum.plan(user) {
+            Ok(Plan::Learning { key, stage }) => format!(
+                "현재 트랙 {} · 단계 {} (고유 {}문제 해결 확인 시 다음 단계). /curriculum으로 확인하세요.",
+                key.track, stage.concept, stage.required
+            ),
+            Ok(Plan::Completed { track }) => {
+                format!("{track} 트랙 완료! /curriculum으로 다음 트랙을 선택하세요.")
+            }
+            Ok(Plan::General) => "일반 티어 추천 모드입니다.".into(),
+            Err(_) => "커리큘럼 진행 조회 실패. /curriculum으로 다시 확인하세요.".into(),
+        }
+    }
+
+    pub fn delivery(&self, user: u64) -> std::io::Result<DeliveryMode> {
+        self.settings
+            .read(user)?
+            .map(|s| s.delivery)
+            .ok_or_else(|| std::io::Error::other("먼저 /setup으로 설정하세요."))
+    }
+    pub fn pause(&self) -> &PauseStore {
+        &self.pause
+    }
+    pub fn claim_resume_prompts(
+        &self,
+        now: DateTime<Utc>,
+    ) -> std::io::Result<Vec<(u64, chrono::NaiveDate)>> {
+        let mut prompts = Vec::new();
+        for user in self.settings.users()? {
+            if let Some(expiry) = self.pause.claim_prompt(user, now)? {
+                prompts.push((user, expiry));
+            }
+        }
+        Ok(prompts)
     }
 
     pub fn checkins(&self) -> &Checkins {
@@ -332,6 +385,17 @@ impl Commands {
         now: DateTime<Utc>,
     ) -> String {
         match name {
+            "version" => format!("코테-마타-봇 {} · {}",env!("CARGO_PKG_VERSION"),env!("BOT_BUILD_REVISION")),
+            "replace" => {
+                let Some(code)=string(options,"offer") else {return "/hint에서 받은 교체 코드를 선택하세요.".into()};
+                let Some(api)=&self.api else {return API_REQUIRED.into()};
+                let Ok(account)=self.links.account(user) else {return "/connect로 계정을 연결하세요.".into()};
+                let Ok(tokens)=self.links.tokens_for(user,account.id,api) else {return "인증 갱신 실패. /account와 /connect를 확인하세요.".into()};
+                match self.replacements.apply(user,now,code,&OAuthSolves {api,tokens,account_id:account.id}) {
+                    Ok(problem)=>format!("교체 완료: {}\n<{}>\n/today로 목록을 확인하세요. /check로 실제 풀이 상태를 갱신할 수 있습니다.",problem.title,problem.submission_url),
+                    Err(error)=>error,
+                }
+            }
             "goal" => {
                 let Some(goal)=string(options,"text") else { return "배우고 싶은 목표를 입력하세요. 예: LRU와 LFU를 배우고 싶어요".into() };
                 let suggested=self.agy.as_ref().and_then(|agy|curriculum::suggest(goal,agy));
@@ -361,7 +425,7 @@ impl Commands {
                 match self.verifications.check(user, now, &OAuthSolves { api, tokens, account_id: account.id }) {
                     Ok(report) => {
                         let manual = self.checkins.progress(user, now).ok().flatten().map(|p| format!("직접 체크: {}/{} (별도 기록)", p.count(), p.total())).unwrap_or_default();
-                        format!("{}\n\n{}\n연결 계정의 채널 알림은 실제 풀이 조회 기준이며, 확인 대기는 알림을 보류합니다.", describe_report(&report), manual)
+                        format!("{}\n\n{}\n{}\n연결 계정의 학습 알림은 실제 풀이 조회 기준이며, 확인 대기는 알림을 보류합니다.", describe_report(&report), manual,self.curriculum_summary(user))
                     },
                     Err(VerifyError::NoRecommendation) => "먼저 /today로 오늘 추천 문제를 받아주세요.".into(),
                     Err(VerifyError::WrongAccount) => "오늘 추천을 받은 핸들과 OAuth 연결 계정이 다릅니다. /account로 계정을 확인하고 오늘 추천 핸들의 계정으로 /connect를 진행해주세요. 기존 추천과 직접 체크는 바꾸지 않았습니다.".into(),
@@ -421,10 +485,10 @@ impl Commands {
                  `/curriculum` — 트랙 조회·선택 (캐시 구현/코딩면접/일반)\n\
                  `/goal text:LRU를 배우고 싶어요` — AI 트랙 제안 후 직접 확인\n\
                  `/hint problem:1` — 선수 개념·쉬운 연습 후보 안내\n\
-                 `/settings reminder:21:00` — 미체크 채널 알림 시각 (한국 시간, 기본 21:00)\n\
+                 `/settings reminder:21:00` — 학습 알림 시각 (한국 시간, 기본 21:00)\n\
                  `/connect`, `/account` — /check를 위한 계정 인증·연결 확인\n\n\
                  오늘 추천을 받은 뒤 연결 계정은 미완료가 확인된 경우, 미연결 계정은 체크가 남은 경우 설정 시각 이후 하루 한 번 멘션합니다. 쉬는 사람과 확인 대기는 제외합니다.\n\
-                 /done은 자기 신고, /check는 API 조회입니다. 연결 계정 알림은 실제 풀이 조회, 미연결 계정 알림은 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 알림 전에 풀이를 자동 확인합니다. AI는 제목·태그 기반 학습 제안이며 장애 시 기본 안내로 전환합니다. DM과 추천 슬롯 교체는 아직 미지원입니다.",
+                 /done은 자기 신고, /check는 API 조회입니다. 연결 계정 알림은 실제 풀이 조회, 미연결 계정 알림은 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 알림 전에 풀이를 자동 확인합니다. AI는 제목·태그 기반 학습 제안이며 장애 시 기본 안내로 전환합니다. `/settings delivery:dm` — 개인 DM 선택 (기본 channel) · `/notify-test` — 수신 테스트\n`/hint problem:1` → `/replace offer:코드` — 쉬운 문제로 교체\n검증된 새 추천의 실제 해결 수에 따라 커리큘럼이 자동 진행됩니다. `/version` — 배포 버전 확인",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -467,9 +531,23 @@ impl Commands {
                 }
             }
             "settings" => {
+                if let Some(goal)=string(options,"goal") {
+                    if options.len()!=1 {return "목표 변경은 다른 옵션과 나누어 실행하세요. 아직 설정을 변경하지 않았습니다.".into()}
+                    if goal=="tier" || TRACKS.iter().any(|track|track.id==goal) {
+                        if self.curriculum.select(user,(goal!="tier").then_some(goal)).is_err() {return STORAGE_ERROR.into()}
+                        return format!("{}\n새 목표는 다음 신규 추천부터 적용됩니다.",self.curriculum_summary(user));
+                    }
+                    let mut proposal=options.to_vec();proposal[0].name="text".into();
+                    return self.execute(user,"goal",&proposal,now);
+                }
+                let handle=string(options,"handle");
                 let count = integer(options, "count");
                 let reminder = string(options, "reminder");
-                if count.is_none() && reminder.is_none() {
+                let delivery = match string(options,"delivery") {
+                    Some("dm")=>Some(DeliveryMode::Dm),Some("channel")=>Some(DeliveryMode::Channel),None=>None,
+                    _=>return "알림 방식은 dm 또는 channel입니다.".into(),
+                };
+                if count.is_none() && reminder.is_none() && delivery.is_none() && handle.is_none() {
                     return match self.settings.read(user) {
                         Ok(Some(settings)) => describe(&settings),
                         Ok(None) => "먼저 /setup으로 초기 설정을 해주세요.".into(),
@@ -481,17 +559,22 @@ impl Commands {
                     Ok(value) => value,
                     Err(_) => return "하루 문제 수는 1~10개입니다.".into(),
                 };
+                let profiles: &dyn ProfileLookup=if handle.is_some() {
+                    let Some(api)=&self.api else {return API_REQUIRED.into()};api
+                } else {&NoProfileLookup};
                 match self.settings.update(
                     user,
                     SettingsUpdate {
+                        handle,
                         daily_count,
                         reminder_time: reminder,
+                        delivery,
                         ..Default::default()
                     },
-                    &NoProfileLookup,
+                    &ProfileDelegate(profiles),
                 ) {
                     Ok(settings) => format!(
-                        "설정 변경 완료.\n{}\n설정 시각 이후 연결 계정은 실제 미완료 확인 시, 미연결 계정은 미체크 시 이 채널에 하루 한 번 알립니다. 확인 대기는 보류하며 DM은 보내지 않습니다.",
+                        "설정 변경 완료.\n{}\n설정 시각 이후 선택한 방식으로 하루 한 번 알립니다. DM 실패 시 공개 채널로 전환하지 않습니다. /notify-test로 수신을 확인하세요.",
                         describe(&settings)
                     ),
                     Err(error) => settings_error(error),
@@ -528,7 +611,7 @@ impl Commands {
                 }
                 match self.curriculum.plan(user) {
                     Ok(Plan::General) => "일반 티어 추천 모드입니다. 트랙: cache(캐시 구현), coding-interview(코딩면접), tier(일반). /today로 추천을 조회하세요. 변경한 트랙은 다음 신규 추천부터 적용됩니다.".into(),
-                    Ok(Plan::Learning { key, stage }) => format!("트랙: {}\n현재 단계: {}\n완료 기준: 해당 단계 문제 {}개 풀이 확인\n/today에서 단계 태그에 맞는 문제를 추천합니다. 변경은 다음 신규 추천부터 적용됩니다. 풀이 상태는 /check에서 확인할 수 있으며 자동 단계 진행은 아직 연결 중입니다.", key.track, stage.concept, stage.required),
+                    Ok(Plan::Learning { key, stage }) => format!("트랙: {}\n현재 단계: {}\n완료 기준: 해당 단계 문제 {}개 풀이 확인\n/today에서 단계 태그에 맞는 문제를 추천합니다. 변경은 다음 신규 추천부터 적용됩니다. 풀이 상태는 /check에서 확인할 수 있으며 검증된 새 추천에서 실제 해결을 확인하면 다음 단계로 자동 진행합니다. /done은 진도에 반영하지 않습니다.", key.track, stage.concept, stage.required),
                     Ok(Plan::Completed { track }) => format!("{track} 트랙 완료! 다른 트랙 또는 tier를 선택하세요."),
                     Err(_) => STORAGE_ERROR.into(),
                 }
@@ -553,6 +636,13 @@ impl Commands {
     }
 }
 
+struct ProfileDelegate<'a>(&'a dyn ProfileLookup);
+impl ProfileLookup for ProfileDelegate<'_> {
+    fn lookup(&self, handle: &str) -> Result<Profile, LookupError> {
+        self.0.lookup(handle)
+    }
+}
+
 struct NoProfileLookup;
 impl ProfileLookup for NoProfileLookup {
     fn lookup(&self, _: &str) -> Result<Profile, LookupError> {
@@ -562,8 +652,12 @@ impl ProfileLookup for NoProfileLookup {
 
 fn describe(settings: &Settings) -> String {
     format!(
-        "핸들: {}\n티어: {}\n하루 문제 수: {}\n알림 시각: {} (한국 시간)",
-        settings.solved_ac_handle, settings.tier, settings.daily_count, settings.reminder_time
+        "핸들: {}\n티어: {}\n하루 문제 수: {}\n알림 시각: {} (한국 시간)\n알림 방식: {:?}",
+        settings.solved_ac_handle,
+        settings.tier,
+        settings.daily_count,
+        settings.reminder_time,
+        settings.delivery
     )
 }
 
@@ -715,6 +809,21 @@ pub fn definitions() -> Vec<CreateCommand> {
             .max_int_value(10)
     };
     vec![
+        CreateCommand::new("version").description("현재 실행 중인 배포 버전 확인"),
+        CreateCommand::new("notify-test")
+            .description("내 설정에 따른 DM 또는 채널 알림 수신 테스트"),
+        CreateCommand::new("replace")
+            .description("/hint에서 제안한 쉬운 문제로 오늘 슬롯 교체")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "offer",
+                    "/hint에서 받은 교체 코드",
+                )
+                .required(true)
+                .min_length(32)
+                .max_length(32),
+            ),
         CreateCommand::new("ping").description("봇 연결 확인"),
         CreateCommand::new("help").description("사용 가능한 명령과 연결 상태 안내"),
         CreateCommand::new("start").description("처음 시작하기 · 내 설정에 맞는 다음 단계 안내"),
@@ -770,12 +879,33 @@ pub fn definitions() -> Vec<CreateCommand> {
             .add_option(count()),
         CreateCommand::new("settings")
             .description("내 설정 조회 및 변경")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "handle",
+                    "변경할 solved.ac 핸들",
+                )
+                .max_length(50),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "goal",
+                    "tier, cache, coding-interview 또는 자유 목표 (별도로 실행)",
+                )
+                .max_length(500),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "delivery", "알림 수신 방식")
+                    .add_string_choice("개인 DM", "dm")
+                    .add_string_choice("지정 채널", "channel"),
+            )
             .add_option(count())
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::String,
                     "reminder",
-                    "미체크 채널 알림 시각 · 한국 시간 HH:MM",
+                    "학습 알림 시각 · 한국 시간 HH:MM",
                 )
                 .max_length(5),
             ),
