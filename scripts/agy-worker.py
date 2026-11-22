@@ -135,8 +135,10 @@ def main():
     socket_path = Path("/run/boj-ai/worker.sock")
     if os.geteuid() == 0 or home != Path("/var/lib/boj-ai") or not binary.is_absolute() or not os.access(binary, os.X_OK) or not model:
         raise SystemExit("AI worker user, HOME, AGY_BIN or AGY_MODEL is not configured")
-    for forbidden in ("/etc/boj-discord-bot/bot.env", "/var/lib/boj-discord-bot"):
-        if os.access(forbidden, os.R_OK) or (Path(forbidden).is_dir() and os.access(forbidden, os.X_OK)):
+    # These path kinds are fixed. Do not stat a deliberately inaccessible file:
+    # pathlib on Python 3.13 propagates PermissionError from its parent directory.
+    for forbidden, directory in (("/etc/boj-discord-bot/bot.env", False), ("/var/lib/boj-discord-bot", True)):
+        if forbidden_accessible(forbidden, directory):
             raise SystemExit("AI worker must not have access to bot credentials or data")
     policy = home / ".gemini/antigravity-cli/settings.json"
     if json.loads(policy.read_text()) != POLICY:
@@ -157,6 +159,10 @@ def main():
         server.binary, server.model, server.home = binary, model, home
         print("isolated agy worker ready", flush=True)
         server.serve_forever()
+
+
+def forbidden_accessible(path, directory=False):
+    return os.access(path, os.R_OK) or (directory and os.access(path, os.X_OK))
 
 
 if __name__ == "__main__":

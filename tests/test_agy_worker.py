@@ -15,6 +15,17 @@ spec.loader.exec_module(worker)
 
 
 class WorkerTests(unittest.TestCase):
+    def test_inaccessible_secret_check_does_not_stat_protected_parent(self):
+        with patch.object(Path, "stat", side_effect=PermissionError("fixture denial")):
+            with patch.object(os, "access", return_value=False):
+                self.assertFalse(worker.forbidden_accessible("/protected/bot.env"))
+                self.assertFalse(worker.forbidden_accessible("/protected/data", True))
+            with patch.object(os, "access", side_effect=lambda path, mode: mode == os.X_OK):
+                self.assertFalse(worker.forbidden_accessible("/protected/bot.env"))
+                self.assertTrue(worker.forbidden_accessible("/protected/data", True))
+            with patch.object(os, "access", return_value=True):
+                self.assertTrue(worker.forbidden_accessible("/protected/bot.env"))
+
     def fake(self, home, body):
         binary = home / "fake-agy"
         binary.write_text(f"#!{sys.executable}\n" + body)
