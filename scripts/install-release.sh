@@ -21,18 +21,30 @@ fi
 if [ -f /etc/systemd/system/boj-ai.service ]; then
     release_has_ai=1
     cp -p /etc/systemd/system/boj-ai.service "$release_backup/ai.service"
+    if [ -f /var/lib/boj-ai/.gemini/antigravity-cli/settings.json ]; then
+        cp -p /var/lib/boj-ai/.gemini/antigravity-cli/settings.json "$release_backup/ai-policy.json"
+    fi
     if [ -f /opt/boj-discord-bot/agy-worker.py ]; then cp -p /opt/boj-discord-bot/agy-worker.py "$release_backup/worker.py"; fi
-    if systemctl is-active --quiet boj-ai; then release_ai_running=1; fi
+    # Auto-restarting/failed workers also need recovery. Preserve an explicitly
+    # stopped (inactive) worker instead of enabling AI without the operator.
+    case "$(systemctl show boj-ai --property=ActiveState --value)" in
+        active|activating|failed) release_ai_running=1 ;;
+    esac
 fi
 rollback() {
     trap - EXIT HUP INT TERM
-    printf '%s\n' '설치 실패. 이전 실행 파일로 복구합니다.' >&2
+    printf '%s\n' '설치 실패. 실패 직후 서비스 로그:' >&2
+    journalctl -u boj-discord-bot -u boj-ai -n 30 --no-pager >&2 || true
+    printf '%s\n' '이전 실행 파일로 복구합니다.' >&2
     systemctl stop boj-discord-bot || true
     if [ "$release_had_binary" -eq 1 ]; then
         install -m 755 "$release_backup/bot" /opt/boj-discord-bot/boj-discord-bot
     fi
     if [ "$release_has_ai" -eq 1 ]; then
         cp -p "$release_backup/ai.service" /etc/systemd/system/boj-ai.service
+        if [ -f "$release_backup/ai-policy.json" ]; then
+            cp -p "$release_backup/ai-policy.json" /var/lib/boj-ai/.gemini/antigravity-cli/settings.json
+        fi
         if [ -f "$release_backup/worker.py" ]; then cp -p "$release_backup/worker.py" /opt/boj-discord-bot/agy-worker.py; fi
         systemctl daemon-reload || true
         if [ "$release_ai_running" -eq 1 ]; then systemctl restart boj-ai || true; fi
@@ -47,6 +59,10 @@ install -m 755 target/release/boj-discord-bot /opt/boj-discord-bot/boj-discord-b
 systemctl stop boj-discord-bot
 mv /opt/boj-discord-bot/boj-discord-bot.new /opt/boj-discord-bot/boj-discord-bot
 if [ "$release_has_ai" -eq 1 ]; then
+    # agy can update settings during use. Reapply the worker's managed policy
+    # with its code; authentication files and worker.env remain untouched.
+    systemctl stop boj-ai
+    install -o bojai -g bojbot -m 600 deploy/agy-settings.json /var/lib/boj-ai/.gemini/antigravity-cli/settings.json
     install -m 644 scripts/agy-worker.py /opt/boj-discord-bot/agy-worker.py
     install -m 644 deploy/boj-ai.service /etc/systemd/system/boj-ai.service
     systemctl daemon-reload
