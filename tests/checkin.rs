@@ -5,6 +5,10 @@ use boj_discord_bot::{
     recommendation::Recommendation,
     settings::{LookupError, Profile, ProfileLookup, SettingsStore, SettingsUpdate},
 };
+use boj_discord_bot::{
+    checkin::ReminderProgress,
+    verification::{PendingReason, Report, ResultRow, VerifiedStatus},
+};
 use chrono::{DateTime, Utc};
 use std::{fs, path::Path, sync::Arc};
 
@@ -45,6 +49,128 @@ fn seed(data: &Path, user: u64, date: &str) {
         serde_json::to_vec(&recommendation).unwrap(),
     )
     .unwrap();
+}
+
+fn report(statuses: &[VerifiedStatus]) -> Report {
+    let now = time("2026-11-21T12:00:00Z");
+    Report {
+        date: now.date_naive(),
+        handle: "alice".into(),
+        account_id: 100,
+        checked_at: now,
+        results: statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| ResultRow {
+                problem: Problem {
+                    id: (index + 1).to_string(),
+                    title: format!("p{}", index + 1),
+                    submission_url: format!("https://judge.example/{}", index + 1),
+                },
+                status: status.clone(),
+                reason: (*status == VerifiedStatus::Pending)
+                    .then_some(PendingReason::UnknownStatus),
+                last_confirmed_solved_at: None,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn verified_completion_and_unknown_state_do_not_consume_the_daily_delivery() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path(), 1, "2026-11-21");
+    let store = Checkins::new(data.path());
+    let now = time("2026-11-21T12:00:00Z");
+    let complete = report(&[
+        VerifiedStatus::Solved,
+        VerifiedStatus::Solved,
+        VerifiedStatus::Solved,
+    ]);
+    assert!(
+        store
+            .claim_due_with(10, now, |_, _| Ok(ReminderProgress::from_report(&complete)))
+            .unwrap()
+            .is_empty()
+    );
+    let uncertain = report(&[
+        VerifiedStatus::Solved,
+        VerifiedStatus::Unsolved,
+        VerifiedStatus::Pending,
+    ]);
+    assert!(
+        store
+            .claim_due_with(10, now, |_, _| Ok(ReminderProgress::from_report(
+                &uncertain
+            )))
+            .unwrap()
+            .is_empty()
+    );
+    let known = report(&[
+        VerifiedStatus::Solved,
+        VerifiedStatus::Unsolved,
+        VerifiedStatus::Solved,
+    ]);
+    let notices = store
+        .claim_due_with(10, now, |_, _| Ok(ReminderProgress::from_report(&known)))
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!((notices[0].checked, notices[0].total), (2, 3));
+    let pending = store
+        .still_due_with(&notices[0], now, |_, _| {
+            Ok(ReminderProgress::from_report(&known))
+        })
+        .unwrap()
+        .unwrap();
+    assert!(pending.verified);
+    assert_eq!(pending.remaining.len(), 1);
+    assert_eq!(pending.remaining[0].id, "2");
+    assert!(
+        Checkins::new(data.path())
+            .claim_due_with(10, now, |_, _| panic!(
+                "must not re-query already attempted user"
+            ))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn api_mode_does_not_use_manual_done_to_hide_unresolved_problems() {
+    let data = tempfile::tempdir().unwrap();
+    seed(data.path(), 1, "2026-11-21");
+    let store = Checkins::new(data.path());
+    let now = time("2026-11-21T12:00:00Z");
+    store.mark(1, now, None, false).unwrap();
+    assert!(store.claim_due(10, now).unwrap().is_empty());
+    let known = report(&[
+        VerifiedStatus::Solved,
+        VerifiedStatus::Unsolved,
+        VerifiedStatus::Solved,
+    ]);
+    let notices = store
+        .claim_due_with(10, now, |_, _| Ok(ReminderProgress::from_report(&known)))
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    PauseStore::new(data.path()).skip(1, now, Some(1)).unwrap();
+    assert!(!store.allowed(&notices[0], now).unwrap());
+    assert!(
+        store
+            .still_due_with(&notices[0], now, |_, _| panic!(
+                "skip must suppress lookups"
+            ))
+            .unwrap()
+            .is_none()
+    );
+    store.retry(&notices[0]).unwrap();
+    PauseStore::new(data.path()).resume(1).unwrap();
+    assert_eq!(
+        store
+            .claim_due_with(10, now, |_, _| Ok(ReminderProgress::from_report(&known)))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::account_link::{AccountLinks, LinkError};
-use crate::checkin::{CheckinError, Checkins, Progress};
+use crate::checkin::{CheckinError, Checkins, Notice, Progress, ReminderProgress};
 use crate::curriculum::{CurriculumStore, Plan};
 use crate::pause::{PauseError, PauseStatus, PauseStore};
 use crate::recommendation::{Recommendation, RecommendationStore};
@@ -73,6 +73,97 @@ impl Commands {
         &self.checkins
     }
 
+    fn reminder_progress(
+        &self,
+        user: u64,
+        now: DateTime<Utc>,
+        progress: Progress,
+        fresh: bool,
+    ) -> std::io::Result<Option<ReminderProgress>> {
+        let account = match self.links.account(user) {
+            Ok(account) => account,
+            Err(LinkError::ReconnectRequired) => return Ok(ReminderProgress::manual(&progress)),
+            Err(_) => return Err(std::io::Error::other("linked account storage unavailable")),
+        };
+        let cached = self.verifications.read(user, now)?.filter(|report| {
+            report.account_id == account.id
+                && report.handle == progress.recommendation.handle
+                && progress
+                    .recommendation
+                    .verified_account_id
+                    .is_none_or(|id| id == account.id)
+                && report.results.len() == progress.total()
+                && report
+                    .results
+                    .iter()
+                    .zip(&progress.recommendation.problems)
+                    .all(|(row, problem)| row.problem.id == problem.id)
+        });
+        if let Some(report) = &cached {
+            // A solved confirmation remains valid for today's immutable problem set.
+            if report
+                .results
+                .iter()
+                .all(|row| row.status == VerifiedStatus::Solved)
+            {
+                return Ok(None);
+            }
+            let age = now.signed_duration_since(report.checked_at).num_seconds();
+            if (0..300).contains(&age)
+                && report
+                    .results
+                    .iter()
+                    .any(|row| row.status == VerifiedStatus::Pending)
+            {
+                return Ok(None);
+            }
+            if !fresh && (0..120).contains(&age) {
+                return Ok(ReminderProgress::from_report(report));
+            }
+        }
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("app credentials unavailable"))?;
+        let tokens = self
+            .links
+            .tokens_for(user, account.id, api)
+            .map_err(|_| std::io::Error::other("OAuth refresh unavailable"))?;
+        let report = self
+            .verifications
+            .check(
+                user,
+                now,
+                &OAuthSolves {
+                    api,
+                    tokens,
+                    account_id: account.id,
+                },
+            )
+            .map_err(|_| std::io::Error::other("solve verification unavailable"))?;
+        Ok(ReminderProgress::from_report(&report))
+    }
+
+    pub fn claim_reminders(
+        &self,
+        channel: u64,
+        now: DateTime<Utc>,
+    ) -> std::io::Result<Vec<Notice>> {
+        self.checkins
+            .claim_due_with(channel, now, |user, progress| {
+                self.reminder_progress(user, now, progress, true)
+            })
+    }
+    pub fn refresh_reminder(
+        &self,
+        notice: &Notice,
+        now: DateTime<Utc>,
+    ) -> std::io::Result<Option<ReminderProgress>> {
+        self.checkins.still_due_with(notice, now, |user, progress| {
+            self.reminder_progress(user, now, progress, false)
+        })
+    }
+
     fn today_recommendation(
         &self,
         user: u64,
@@ -135,7 +226,7 @@ impl Commands {
                 match self.verifications.check(user, now, &OAuthSolves { api, tokens, account_id: account.id }) {
                     Ok(report) => {
                         let manual = self.checkins.progress(user, now).ok().flatten().map(|p| format!("직접 체크: {}/{} (별도 기록)", p.count(), p.total())).unwrap_or_default();
-                        format!("{}\n\n{}\n채널 알림은 현재 /done 직접 체크를 기준으로 동작합니다.", describe_report(&report), manual)
+                        format!("{}\n\n{}\n연결 계정의 채널 알림은 실제 풀이 조회 기준이며, 확인 대기는 알림을 보류합니다.", describe_report(&report), manual)
                     },
                     Err(VerifyError::NoRecommendation) => "먼저 /today로 오늘 추천 문제를 받아주세요.".into(),
                     Err(VerifyError::WrongAccount) => "오늘 추천을 받은 핸들과 OAuth 연결 계정이 다릅니다. /account로 계정을 확인하고 오늘 추천 핸들의 계정으로 /connect를 진행해주세요. 기존 추천과 직접 체크는 바꾸지 않았습니다.".into(),
@@ -147,7 +238,7 @@ impl Commands {
             "start" => match self.settings.read(user) {
                 Ok(None) => "**코테-마타-봇 시작하기**\n내 수준에 맞는 연습 문제를 매일 추천받으세요.\n\n1. solved.ac 프로필에서 본인의 아이디(핸들)를 확인하세요. Discord 닉네임과는 다릅니다.\n2. `/setup`을 선택하고 `handle`에 그 아이디, `count`에 하루 문제 수를 넣으세요. 처음에는 1~3개를 추천합니다.\n3. `/today`로 추천을 받고, 풀었으면 `/done`으로 체크하세요.\n\n추천 문제는 이미 푼 문제일 수도 있습니다. 지금은 별도의 계정 인증 없이 시작할 수 있습니다.".into(),
                 Ok(Some(settings)) => match self.pause.current(user, now) {
-                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n계정을 연결했다면 /check로 실제 풀이 상태를 조회하세요. 계정을 연결하면 다음 새 추천부터 해결된 문제를 제외합니다. 백그라운드 자동 확인은 아직 지원하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
+                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n계정을 연결했다면 /check로 실제 풀이 상태를 조회하세요. 계정을 연결하면 다음 새 추천부터 해결된 문제를 제외합니다. 연결 계정은 알림 시각 이후 풀이를 자동 확인합니다.", settings.solved_ac_handle, settings.daily_count),
                     Ok(_) => "**지금은 학습을 쉬고 있습니다.**\n다시 시작하려면 `/resume` → `/today` 순서로 실행하세요.\n내 설정은 `/settings`에서 확인할 수 있습니다.".into(),
                     Err(_) => STORAGE_ERROR.into(),
                 },
@@ -195,8 +286,8 @@ impl Commands {
                  `/curriculum` — 트랙 조회·선택 (캐시 구현/코딩면접/일반)\n\
                  `/settings reminder:21:00` — 미체크 채널 알림 시각 (한국 시간, 기본 21:00)\n\
                  `/connect`, `/account` — /check를 위한 계정 인증·연결 확인\n\n\
-                 오늘 추천을 받은 뒤 체크가 남아 있으면 설정 시각 이후 이 채널에서 하루 한 번 멘션합니다. 쉬는 사람은 제외합니다.\n\
-                 /done은 자기 신고, /check는 API 조회입니다. 알림은 아직 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 백그라운드 풀이 확인·DM·AI 도움은 아직 미지원입니다.",
+                 오늘 추천을 받은 뒤 연결 계정은 미완료가 확인된 경우, 미연결 계정은 체크가 남은 경우 설정 시각 이후 하루 한 번 멘션합니다. 쉬는 사람과 확인 대기는 제외합니다.\n\
+                 /done은 자기 신고, /check는 API 조회입니다. 연결 계정 알림은 실제 풀이 조회, 미연결 계정 알림은 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 알림 전에 풀이를 자동 확인합니다. DM·AI 도움은 아직 미지원입니다.",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -263,7 +354,7 @@ impl Commands {
                     &NoProfileLookup,
                 ) {
                     Ok(settings) => format!(
-                        "설정 변경 완료.\n{}\n오늘 추천을 받고 미체크 문제가 남아 있으면 이 채널에서 설정 시각 이후 하루 한 번 멘션합니다. DM은 보내지 않습니다.",
+                        "설정 변경 완료.\n{}\n설정 시각 이후 연결 계정은 실제 미완료 확인 시, 미연결 계정은 미체크 시 이 채널에 하루 한 번 알립니다. 확인 대기는 보류하며 DM은 보내지 않습니다.",
                         describe(&settings)
                     ),
                     Err(error) => settings_error(error),
@@ -300,7 +391,7 @@ impl Commands {
                 }
                 match self.curriculum.plan(user) {
                     Ok(Plan::General) => "일반 티어 추천 모드입니다. 트랙: cache(캐시 구현), coding-interview(코딩면접), tier(일반). /today로 추천을 조회하세요. 변경한 트랙은 다음 신규 추천부터 적용됩니다.".into(),
-                    Ok(Plan::Learning { key, stage }) => format!("트랙: {}\n현재 단계: {}\n완료 기준: 해당 단계 문제 {}개 풀이 확인\n/today에서 단계 태그에 맞는 문제를 추천합니다. 변경은 다음 신규 추천부터 적용됩니다. 풀이 확인과 자동 단계 진행은 아직 연결 중입니다.", key.track, stage.concept, stage.required),
+                    Ok(Plan::Learning { key, stage }) => format!("트랙: {}\n현재 단계: {}\n완료 기준: 해당 단계 문제 {}개 풀이 확인\n/today에서 단계 태그에 맞는 문제를 추천합니다. 변경은 다음 신규 추천부터 적용됩니다. 풀이 상태는 /check에서 확인할 수 있으며 자동 단계 진행은 아직 연결 중입니다.", key.track, stage.concept, stage.required),
                     Ok(Plan::Completed { track }) => format!("{track} 트랙 완료! 다른 트랙 또는 tier를 선택하세요."),
                     Err(_) => STORAGE_ERROR.into(),
                 }
@@ -315,7 +406,7 @@ impl Commands {
                             Ok(Some(progress)) => format!("직접 완료 체크: {}/{}", progress.count(), progress.total()),
                             _ => "체크 현황은 /status에서 확인하세요.".into(),
                         };
-                        format!("{}\n\n{}\n풀었으면 /done · 일부만 풀었으면 /done problem:1\n미체크 문제가 있으면 설정한 알림 시각 이후 이 채널에서 하루 한 번 멘션합니다. 시각 변경은 /settings reminder:21:00", describe_recommendation(&recommendation), checked)
+                        format!("{}\n\n{}\n풀었으면 /done · 일부만 풀었으면 /done problem:1\n설정한 알림 시각 이후 연결 계정은 실제 미완료 확인 시, 미연결 계정은 미체크 시 하루 한 번 멘션합니다. 시각 변경은 /settings reminder:21:00", describe_recommendation(&recommendation), checked)
                     },
                     Err(message) => message,
                 }
@@ -408,7 +499,7 @@ fn describe_progress(progress: &Progress) -> String {
         ));
     }
     lines.push(if progress.count() == progress.total() {
-        "오늘 추천을 모두 체크했습니다. 미체크 알림 대상에서 제외됩니다."
+        "오늘 추천을 모두 직접 체크했습니다. 연결 계정의 알림 여부는 실제 풀이 조회 결과로 결정됩니다."
     } else {
         "/done으로 전체 체크 · /done problem:1로 한 문제 체크 · /done problem:1 undo:true로 취소"
     }.into());

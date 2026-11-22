@@ -1,9 +1,11 @@
 //! Self-reported progress, deliberately separate from verified solve records.
 use crate::{
+    assignment::Problem,
     assignment::seoul_time,
     pause::{self, PauseStatus},
     recommendation::Recommendation,
     settings::SettingsStore,
+    verification::{Report, VerifiedStatus},
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -56,6 +58,51 @@ pub struct Notice {
     pub checked: usize,
     pub total: usize,
     channel: u64,
+}
+
+pub struct ReminderProgress {
+    pub checked: usize,
+    pub total: usize,
+    pub remaining: Vec<Problem>,
+    pub verified: bool,
+}
+impl ReminderProgress {
+    pub fn manual(progress: &Progress) -> Option<Self> {
+        let remaining: Vec<_> = progress
+            .recommendation
+            .problems
+            .iter()
+            .filter(|p| !progress.checked.contains(&p.id))
+            .cloned()
+            .collect();
+        (!remaining.is_empty()).then(|| Self {
+            checked: progress.count(),
+            total: progress.total(),
+            remaining,
+            verified: false,
+        })
+    }
+    pub fn from_report(report: &Report) -> Option<Self> {
+        if report
+            .results
+            .iter()
+            .any(|row| row.status == VerifiedStatus::Pending)
+        {
+            return None;
+        }
+        let remaining: Vec<_> = report
+            .results
+            .iter()
+            .filter(|row| row.status == VerifiedStatus::Unsolved)
+            .map(|row| row.problem.clone())
+            .collect();
+        (!remaining.is_empty()).then(|| Self {
+            checked: report.results.len() - remaining.len(),
+            total: report.results.len(),
+            remaining,
+            verified: true,
+        })
+    }
 }
 
 pub struct Checkins {
@@ -155,7 +202,7 @@ impl Checkins {
         Ok(progress)
     }
 
-    fn due(&self, user: u64, now: DateTime<Utc>) -> io::Result<Option<Progress>> {
+    fn eligible(&self, user: u64, now: DateTime<Utc>) -> io::Result<Option<Progress>> {
         let local = seoul_time(now);
         if pause::status(&self.data.join("users"), user, local.date_naive())? != PauseStatus::Active
         {
@@ -171,7 +218,7 @@ impl Checkins {
         }
         Ok(self
             .progress(user, now)?
-            .filter(|progress| progress.total() > progress.count()))
+            .filter(|progress| progress.total() > 0))
     }
 
     fn marker(&self, notice: &Notice) -> PathBuf {
@@ -183,6 +230,17 @@ impl Checkins {
 
     /// Persist before network send. Ambiguous delivery is not retried that day.
     pub fn claim_due(&self, channel: u64, now: DateTime<Utc>) -> io::Result<Vec<Notice>> {
+        self.claim_due_with(channel, now, |_, progress| {
+            Ok(ReminderProgress::manual(&progress))
+        })
+    }
+
+    pub fn claim_due_with(
+        &self,
+        channel: u64,
+        now: DateTime<Utc>,
+        mut resolve: impl FnMut(u64, Progress) -> io::Result<Option<ReminderProgress>>,
+    ) -> io::Result<Vec<Notice>> {
         let users = match fs::read_dir(self.data.join("users")) {
             Ok(users) => users,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -204,20 +262,25 @@ impl Checkins {
                 continue;
             };
             let outcome = (|| -> io::Result<Option<Notice>> {
-                let Some(progress) = self.due(user, now)? else {
-                    return Ok(None);
-                };
-                let notice = Notice {
+                let mut notice = Notice {
                     user,
                     date: seoul_time(now).date_naive(),
-                    checked: progress.count(),
-                    total: progress.total(),
+                    checked: 0,
+                    total: 0,
                     channel,
                 };
                 let marker = self.marker(&notice);
                 if marker.try_exists()? {
                     return Ok(None);
                 }
+                let Some(progress) = self.eligible(user, now)? else {
+                    return Ok(None);
+                };
+                let Some(progress) = resolve(user, progress)? else {
+                    return Ok(None);
+                };
+                notice.checked = progress.checked;
+                notice.total = progress.total;
                 let directory = marker.parent().expect("marker has parent");
                 fs::create_dir_all(directory)?;
                 let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
@@ -233,7 +296,9 @@ impl Checkins {
                 Ok(Some(notice)) => notices.push(notice),
                 Ok(None) => {}
                 Err(_) => {
-                    eprintln!("사용자 {user}의 수동 완료 알림 상태를 읽거나 저장하지 못했습니다.")
+                    eprintln!(
+                        "사용자 {user}의 알림 조회를 보류했습니다. 인증·API·저장 상태를 확인하세요."
+                    )
                 }
             }
         }
@@ -245,12 +310,31 @@ impl Checkins {
         notice: &Notice,
         now: DateTime<Utc>,
     ) -> io::Result<Option<(usize, usize)>> {
+        Ok(self
+            .still_due_with(notice, now, |_, progress| {
+                Ok(ReminderProgress::manual(&progress))
+            })?
+            .map(|progress| (progress.checked, progress.total)))
+    }
+
+    pub fn still_due_with(
+        &self,
+        notice: &Notice,
+        now: DateTime<Utc>,
+        mut resolve: impl FnMut(u64, Progress) -> io::Result<Option<ReminderProgress>>,
+    ) -> io::Result<Option<ReminderProgress>> {
         if notice.date != seoul_time(now).date_naive() {
             return Ok(None);
         }
-        Ok(self
-            .due(notice.user, now)?
-            .map(|progress| (progress.count(), progress.total())))
+        match self.eligible(notice.user, now)? {
+            Some(progress) => resolve(notice.user, progress),
+            None => Ok(None),
+        }
+    }
+
+    pub fn allowed(&self, notice: &Notice, now: DateTime<Utc>) -> io::Result<bool> {
+        Ok(notice.date == seoul_time(now).date_naive()
+            && self.eligible(notice.user, now)?.is_some())
     }
     /// Only use after an explicit response proving Discord rejected the send.
     pub fn retry(&self, notice: &Notice) -> io::Result<()> {

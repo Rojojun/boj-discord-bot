@@ -21,39 +21,83 @@ async fn checkin_scheduler(
         timer.tick().await;
         let store = Arc::clone(&commands);
         let due = tokio::task::spawn_blocking(move || {
-            store
-                .checkins()
-                .claim_due(channel.get(), std::time::SystemTime::now().into())
+            store.claim_reminders(channel.get(), std::time::SystemTime::now().into())
         })
         .await;
         let notices = match due {
             Ok(Ok(notices)) => notices,
             _ => {
-                eprintln!("수동 완료 체크 알림 스캔 실패. 데이터 폴더 권한을 확인하세요.");
+                eprintln!("학습 알림 스캔 실패. 데이터 폴더 권한을 확인하세요.");
                 continue;
             }
         };
         for notice in notices {
             let store = Arc::clone(&commands);
             let refreshed = tokio::task::spawn_blocking(move || {
-                let progress = store
-                    .checkins()
-                    .still_due(&notice, std::time::SystemTime::now().into());
+                let progress = store.refresh_reminder(&notice, std::time::SystemTime::now().into());
+                // API calls may cross midnight or race with /skip. Check again
+                // after lookup before handing the message to Discord.
+                let progress = progress.and_then(|progress| {
+                    if store
+                        .checkins()
+                        .allowed(&notice, std::time::SystemTime::now().into())?
+                    {
+                        Ok(progress)
+                    } else {
+                        Ok(None)
+                    }
+                });
                 (notice, progress)
             })
             .await;
-            let (notice, checked, total) = match refreshed {
-                Ok((notice, Ok(Some((checked, total))))) => (notice, checked, total),
-                // Markers remain claimed on a race with /done, /skip, or midnight.
-                Ok((_, Ok(None))) => continue,
+            let (notice, progress) = match refreshed {
+                Ok((notice, Ok(Some(progress)))) => (notice, progress),
+                Ok((notice, _)) => {
+                    // No Discord send happened, so pending/skip/completion must
+                    // not consume today's one delivery opportunity.
+                    let store = Arc::clone(&commands);
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.checkins().retry(&notice)).await;
+                    continue;
+                }
                 _ => {
                     eprintln!("완료 체크 알림 발송 전 재확인 실패.");
                     continue;
                 }
             };
-            let message = CreateMessage::new()
-                .content(format!("📣 <@{}> 오늘 추천 {}개 중 {}개는 아직 **완료 체크가 없습니다** 👀\n풀었다면 `/done`, 일부만 풀었다면 `/done problem:1`로 체크해주세요. 실제 풀이 여부를 조회한 알림은 아닙니다.", notice.user, total, total - checked))
-                .allowed_mentions(CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false).users([notice.user]));
+            let content = if progress.verified {
+                let mut lines = vec![format!(
+                    "📣 <@{}> 오늘 추천 {}/{}개 해결 확인 · {}개 미완료입니다.",
+                    notice.user,
+                    progress.checked,
+                    progress.total,
+                    progress.remaining.len()
+                )];
+                for problem in &progress.remaining {
+                    lines.push(format!("• {}\n<{}>", problem.title, problem.submission_url));
+                }
+                lines.push("solved.ac 조회 기준입니다. 제출 후 반영이 늦으면 나중에 /check로 확인해주세요.".into());
+                lines.join("\n")
+            } else {
+                format!(
+                    "📣 <@{}> 오늘 추천 {}개 중 {}개는 아직 **완료 체크가 없습니다** 👀\n풀었다면 `/done`, 일부만 풀었다면 `/done problem:1`로 체크해주세요. 실제 풀이 여부를 조회한 알림은 아닙니다.",
+                    notice.user,
+                    progress.total,
+                    progress.remaining.len()
+                )
+            };
+            let mut message = CreateMessage::new().allowed_mentions(
+                CreateAllowedMentions::new()
+                    .all_users(false)
+                    .all_roles(false)
+                    .everyone(false)
+                    .users([notice.user]),
+            );
+            if content.encode_utf16().count() > 1900 {
+                message = message.content(format!("📣 <@{}> 오늘 미완료 문제 {}개를 파일로 첨부했습니다. solved.ac 조회 기준입니다.", notice.user, progress.remaining.len())).add_file(CreateAttachment::bytes(content.into_bytes(), "remaining-problems.txt"));
+            } else {
+                message = message.content(content);
+            }
             if let Err(error) = channel.send_message(&http, message).await {
                 let rejected = matches!(&error, serenity::Error::Http(error) if error.status_code().is_some_and(|status| status.is_client_error()));
                 if rejected {
@@ -211,7 +255,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&client.http),
         channel,
     ));
-    println!("수동 완료 체크 알림 활성화: 설정 시각 이후 지정 채널로 하루 한 번 (60초 간격 확인)");
+    println!(
+        "학습 알림 활성화: 연결 계정은 실제 풀이 조회, 미연결 계정은 직접 체크 기준 (60초 간격 확인)"
+    );
 
     let shards = client.shard_manager.clone();
     tokio::spawn(async move {
