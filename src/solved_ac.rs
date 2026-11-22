@@ -228,10 +228,58 @@ impl RecommendationSource for SolvedAc {
     }
 }
 
+pub struct LinkedRecommendations<'a> {
+    pub api: &'a SolvedAc,
+    pub tokens: Tokens,
+    pub account_id: u64,
+}
+impl ProfileLookup for LinkedRecommendations<'_> {
+    fn lookup(&self, handle: &str) -> Result<Profile, LookupError> {
+        self.api.lookup(handle)
+    }
+}
+impl RecommendationSource for LinkedRecommendations<'_> {
+    fn validate_handle(&self, handle: &str) -> Result<(), String> {
+        if !self.tokens.permits_solves() {
+            return Err("풀이 조회 권한이 없습니다. /connect에서 다시 승인해주세요.".into());
+        }
+        let expected = self
+            .api
+            .user_account(handle)
+            .map_err(recommendation_api_error)?;
+        let owner = self
+            .api
+            .account(&self.tokens)
+            .map_err(recommendation_api_error)?;
+        if expected.id != self.account_id || owner.id != self.account_id {
+            return Err("설정한 핸들과 OAuth 계정이 다릅니다. /account와 /settings를 확인하고 같은 계정으로 /connect 또는 /setup을 진행해주세요.".into());
+        }
+        Ok(())
+    }
+    fn verified_account_id(&self) -> Option<u64> {
+        Some(self.account_id)
+    }
+    fn problems(&self, tier: u8, tags: &[&str], limit: usize) -> Result<Vec<Candidate>, String> {
+        recommend_from_mode(tier, tags, limit, true, |url| {
+            decode(self.api.request("GET", url, Some(&self.tokens)).call())
+        })
+    }
+}
+
 fn recommend_from(
     tier: u8,
     tags: &[&str],
     limit: usize,
+    load: impl FnMut(&Url) -> Result<serde_json::Value, ApiError>,
+) -> Result<Vec<Candidate>, String> {
+    recommend_from_mode(tier, tags, limit, false, load)
+}
+
+fn recommend_from_mode(
+    tier: u8,
+    tags: &[&str],
+    limit: usize,
+    only_unsolved: bool,
     mut load: impl FnMut(&Url) -> Result<serde_json::Value, ApiError>,
 ) -> Result<Vec<Candidate>, String> {
     if limit == 0 {
@@ -283,10 +331,17 @@ fn recommend_from(
         }
     });
     let mut candidates = Vec::new();
+    let mut solved_excluded = 0;
+    let mut unknown_excluded = 0;
     let had_matches = !metadata.is_empty();
     // The list omits ojLinks. Fetch details only for matching candidates,
     // with a bounded allowance for candidates that have no usable link.
-    for (_, mut item) in metadata.into_iter().take(limit.saturating_mul(2).min(20)) {
+    let budget = if only_unsolved {
+        30
+    } else {
+        limit.saturating_mul(2).min(20)
+    };
+    for (_, mut item) in metadata.into_iter().take(budget) {
         let problem_id = item
             .get("problemId")
             .and_then(serde_json::Value::as_u64)
@@ -300,6 +355,19 @@ fn recommend_from(
             Err(ApiError::NotFound) => continue,
             Err(error) => return Err(recommendation_api_error(error)),
         };
+        if only_unsolved {
+            match parse_solve_status(&detail) {
+                Some(true) => {
+                    solved_excluded += 1;
+                    continue;
+                }
+                None => {
+                    unknown_excluded += 1;
+                    continue;
+                }
+                Some(false) => {}
+            }
+        }
         // Never invent judge URLs from problem IDs.
         if let Some(links) = detail.get("ojLinks") {
             item["ojLinks"] = links.clone();
@@ -312,6 +380,11 @@ fn recommend_from(
         }
     }
     if had_matches && candidates.is_empty() {
+        if only_unsolved && solved_excluded + unknown_excluded > 0 {
+            return Err(format!(
+                "조회한 범위에서 미완료 상태를 확인한 추천 후보가 부족합니다. 해결 확인 {solved_excluded}개와 상태 미확정 {unknown_excluded}개는 제외했습니다. 상태 미제공을 미해결로 간주하지 않습니다. 기존 기록은 유지됩니다."
+            ));
+        }
         return Err("난이도에 맞는 문제는 찾았지만 상세 응답에서 HTTPS 제출 링크를 읽지 못했습니다. 관리자에게 문제 상세 응답의 ojLinks 확인을 요청하세요.".into());
     }
     Ok(candidates)
@@ -442,6 +515,60 @@ fn decode<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_recommendations_exclude_solved_and_unknown_states() {
+        let list = serde_json::json!({"total":4,"page":1,"pageSize":50,"problems":
+            (1..=4).map(|id| serde_json::json!({"problemId":id,"level":10,"titles":[{"title":format!("p{id}")}],"tags":[]})).collect::<Vec<_>>()
+        });
+        let mut calls = Vec::new();
+        let result = recommend_from_mode(10,&[],2,true,|url| {
+            calls.push(url.path().to_owned());
+            if url.path()=="/api/v4/problems" { return Ok(list.clone()); }
+            let id = url.path().rsplit('/').next().unwrap();
+            let status = match id { "1"=>serde_json::json!("solved"),"2"=>serde_json::json!("partial"),"3"=>serde_json::Value::Null,_=>serde_json::json!("tried") };
+            Ok(serde_json::json!({"userStatus":status,"ojLinks":[{"url":format!("https://judge.example/{id}")}]}))
+        }).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|p| p.problem.id.as_str())
+                .collect::<Vec<_>>(),
+            ["2", "4"]
+        );
+        assert_eq!(calls.len(), 5);
+    }
+
+    #[test]
+    fn authenticated_unknown_status_does_not_fall_back_to_unverified_preview() {
+        let list = serde_json::json!({"total":1,"page":1,"pageSize":50,"problems":[{"problemId":1,"level":10,"title":"p1","tags":[]}]});
+        let result = recommend_from_mode(10, &[], 1, true, |url| {
+            if url.path() == "/api/v4/problems" {
+                Ok(list.clone())
+            } else {
+                Ok(
+                    serde_json::json!({"userStatus":null,"ojLinks":[{"url":"https://judge.example/1"}]}),
+                )
+            }
+        });
+        assert!(result.unwrap_err().contains("상태 미확정 1개"));
+        let source = LinkedRecommendations {
+            api: &SolvedAc::new("app".into(), "secret".into()),
+            tokens: Tokens {
+                access_token: String::new(),
+                expires_in: 100,
+                scope: String::new(),
+                refresh_token: None,
+            },
+            account_id: 100,
+        };
+        assert!(
+            source
+                .validate_handle("alice")
+                .unwrap_err()
+                .contains("권한")
+        );
+    }
 
     #[test]
     fn solve_state_requires_an_explicit_known_status() {

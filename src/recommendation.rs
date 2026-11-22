@@ -1,4 +1,4 @@
-//! OAuth-free recommendations are previews, never confirmed-unsolved assignments.
+//! Daily recommendations preserve whether an OAuth account's solve state was checked.
 use crate::{
     assignment::{Problem, seoul_time},
     curriculum::{CurriculumStore, Plan},
@@ -22,11 +22,19 @@ pub struct Candidate {
 }
 
 pub trait RecommendationSource: ProfileLookup {
+    fn validate_handle(&self, _handle: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn verified_account_id(&self) -> Option<u64> {
+        None
+    }
     fn problems(&self, tier: u8, tags: &[&str], limit: usize) -> Result<Vec<Candidate>, String>;
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Recommendation {
+    #[serde(default)]
+    pub verified_account_id: Option<u64>,
     pub handle: String,
     pub tier: u8,
     pub requested: u8,
@@ -40,6 +48,27 @@ pub struct RecommendationStore {
 }
 
 impl RecommendationStore {
+    pub fn existing(
+        &self,
+        user: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Recommendation>, String> {
+        let date = seoul_time(now).date_naive();
+        if pause::status(&self.data.join("users"), user, date).map_err(storage)?
+            != PauseStatus::Active
+        {
+            return Err("학습 정지 중입니다. /resume으로 재개해주세요.".into());
+        }
+        read(
+            &self
+                .data
+                .join("users")
+                .join(user.to_string())
+                .join("recommendations")
+                .join(format!("{date}.json")),
+        )
+        .map_err(storage)
+    }
     pub fn new(data: &Path) -> Self {
         Self {
             data: data.into(),
@@ -71,6 +100,7 @@ impl RecommendationStore {
             .read(user)
             .map_err(storage)?
             .ok_or("먼저 /setup으로 핸들과 문제 수를 설정하세요.")?;
+        source.validate_handle(&settings.solved_ac_handle)?;
         let profile = source
             .lookup(&settings.solved_ac_handle)
             .map_err(|_| "현재 티어 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")?;
@@ -116,6 +146,7 @@ impl RecommendationStore {
             return Err("조회한 후보에서 현재 난이도·주제에 맞고 제출 링크가 있는 문제를 찾지 못했습니다. 다음 조회에서 다시 시도할 수 있습니다.".into());
         }
         let recommendation = Recommendation {
+            verified_account_id: source.verified_account_id(),
             handle: profile.handle,
             tier,
             requested: settings.daily_count,

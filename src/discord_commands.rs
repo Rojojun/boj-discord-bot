@@ -6,7 +6,7 @@ use crate::recommendation::{Recommendation, RecommendationStore};
 use crate::settings::{
     LookupError, Profile, ProfileLookup, Settings, SettingsError, SettingsStore, SettingsUpdate,
 };
-use crate::solved_ac::SolvedAc;
+use crate::solved_ac::{LinkedRecommendations, SolvedAc};
 use crate::verification::{
     OAuthSolves, PendingReason, Report, Verifications, VerifiedStatus, VerifyError,
 };
@@ -73,6 +73,40 @@ impl Commands {
         &self.checkins
     }
 
+    fn today_recommendation(
+        &self,
+        user: u64,
+        now: DateTime<Utc>,
+        api: &SolvedAc,
+    ) -> Result<Recommendation, String> {
+        // Preserve the saved set and skip state before any OAuth/API work.
+        if let Some(saved) = self.recommendations.existing(user, now)? {
+            return Ok(saved);
+        }
+        match self.links.account(user) {
+            Ok(account) => {
+                let tokens = self
+                    .links
+                    .tokens_for(user, account.id, api)
+                    .map_err(|_| "계정 인증을 갱신하지 못했습니다. /connect로 다시 연결해주세요. 풀이 미확인 추천으로 자동 전환하지는 않습니다.".to_owned())?;
+                self.recommendations.today(
+                    user,
+                    now,
+                    &self.settings,
+                    &LinkedRecommendations {
+                        api,
+                        tokens,
+                        account_id: account.id,
+                    },
+                )
+            }
+            Err(LinkError::ReconnectRequired) => {
+                self.recommendations.today(user, now, &self.settings, api)
+            }
+            Err(_) => Err(STORAGE_ERROR.into()),
+        }
+    }
+
     pub fn execute(
         &self,
         user: u64,
@@ -113,7 +147,7 @@ impl Commands {
             "start" => match self.settings.read(user) {
                 Ok(None) => "**코테-마타-봇 시작하기**\n내 수준에 맞는 연습 문제를 매일 추천받으세요.\n\n1. solved.ac 프로필에서 본인의 아이디(핸들)를 확인하세요. Discord 닉네임과는 다릅니다.\n2. `/setup`을 선택하고 `handle`에 그 아이디, `count`에 하루 문제 수를 넣으세요. 처음에는 1~3개를 추천합니다.\n3. `/today`로 추천을 받고, 풀었으면 `/done`으로 체크하세요.\n\n추천 문제는 이미 푼 문제일 수도 있습니다. 지금은 별도의 계정 인증 없이 시작할 수 있습니다.".into(),
                 Ok(Some(settings)) => match self.pause.current(user, now) {
-                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n계정을 연결했다면 /check로 실제 풀이 상태를 조회하세요. 이미 푼 문제 제외와 백그라운드 자동 확인은 아직 지원하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
+                    Ok(PauseStatus::Active) => format!("**설정이 완료되어 있습니다!**\n{}님 · 하루 {}문제\n\n**다음: `/today`로 오늘의 추천을 받으세요.**\n문제 링크를 열어 풀고 `/done`으로 완료 체크하세요. 일부만 풀었다면 `/done problem:1`, 현황은 `/status`입니다. 같은 날에는 같은 추천이 표시됩니다.\n\n문제 수 변경: `/settings count:2`\n쉬기: `/skip days:1`\n전체 사용법: `/help`\n\n계정을 연결했다면 /check로 실제 풀이 상태를 조회하세요. 계정을 연결하면 다음 새 추천부터 해결된 문제를 제외합니다. 백그라운드 자동 확인은 아직 지원하지 않습니다.", settings.solved_ac_handle, settings.daily_count),
                     Ok(_) => "**지금은 학습을 쉬고 있습니다.**\n다시 시작하려면 `/resume` → `/today` 순서로 실행하세요.\n내 설정은 `/settings`에서 확인할 수 있습니다.".into(),
                     Err(_) => STORAGE_ERROR.into(),
                 },
@@ -162,7 +196,7 @@ impl Commands {
                  `/settings reminder:21:00` — 미체크 채널 알림 시각 (한국 시간, 기본 21:00)\n\
                  `/connect`, `/account` — /check를 위한 계정 인증·연결 확인\n\n\
                  오늘 추천을 받은 뒤 체크가 남아 있으면 설정 시각 이후 이 채널에서 하루 한 번 멘션합니다. 쉬는 사람은 제외합니다.\n\
-                 /done은 자기 신고, /check는 API 조회입니다. 알림은 아직 /done 기준입니다. 이미 푼 문제 제외·백그라운드 풀이 확인·DM·AI 도움은 아직 미지원입니다.",
+                 /done은 자기 신고, /check는 API 조회입니다. 알림은 아직 /done 기준입니다. 연결된 계정은 새 추천에서 해결·상태 미확정 문제를 제외합니다. 백그라운드 풀이 확인·DM·AI 도움은 아직 미지원입니다.",
             ),
             "connect" => {
                 let Some(api) = &self.api else {
@@ -198,7 +232,7 @@ impl Commands {
                 };
                 match self.settings.setup(user, handle, count, api) {
                     Ok(settings) => format!(
-                        "설정 완료!\n{}\n/today로 오늘의 추천을 받으세요. 이미 푼 문제 여부는 확인하지 않습니다.",
+                        "설정 완료!\n{}\n/today로 추천을 받으세요. 계정이 연결돼 있으면 다음 새 추천부터 해결된 문제를 제외합니다.",
                         describe(&settings)
                     ),
                     Err(error) => settings_error(error),
@@ -275,7 +309,7 @@ impl Commands {
                 let Some(api) = &self.api else {
                     return API_REQUIRED.into();
                 };
-                match self.recommendations.today(user, now, &self.settings, api) {
+                match self.today_recommendation(user, now, api) {
                     Ok(recommendation) => {
                         let checked = match self.checkins.progress(user, now) {
                             Ok(Some(progress)) => format!("직접 완료 체크: {}/{}", progress.count(), progress.total()),
@@ -393,7 +427,11 @@ fn describe_recommendation(recommendation: &Recommendation) -> String {
     if let Some(topic) = &recommendation.topic {
         lines.push(format!("학습 주제: {topic}"));
     }
-    lines.push("OAuth 미사용: 이미 푼 문제 여부는 확인하지 않았습니다. 같은 날에는 저장된 추천을 보여줍니다.".into());
+    lines.push(if recommendation.verified_account_id.is_some() {
+        "추천 시점에 연결 계정의 미완료 상태를 확인한 문제입니다. 현재 상태는 /check로 다시 확인하세요. 같은 날에는 저장된 추천을 보여줍니다."
+    } else {
+        "추천 시점에 풀이 여부를 확인하지 않았으므로 이미 푼 문제가 포함될 수 있습니다. 같은 날에는 저장된 추천을 보여줍니다."
+    }.into());
     let count = recommendation.problems.len();
     for (index, problem) in recommendation.problems.iter().enumerate() {
         let line = format!(

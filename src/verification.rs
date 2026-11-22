@@ -129,6 +129,12 @@ impl Verifications {
         )?
         .ok_or(VerifyError::NoRecommendation)?;
         let account_id = source.identity(&recommendation.handle)?;
+        if recommendation
+            .verified_account_id
+            .is_some_and(|id| id != account_id)
+        {
+            return Err(VerifyError::WrongAccount);
+        }
         let previous = self
             .read(user, now)?
             .filter(|report| report.account_id == account_id);

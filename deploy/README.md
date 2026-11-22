@@ -1,7 +1,7 @@
 # Debian 13 x86_64 바이너리 배포
 
 서버에서 최초 빌드 후 systemd가 실행 파일을 직접 실행한다. 실행 중에는 Rust나 Cargo가 필요 없다.
-배포 대상은 `/help`, `/setup`, `/settings`, `/skip`, `/resume`, `/curriculum`, `/today` 명령이다. `/setup`과 `/today`에는 solved.ac 앱 인증값이 필요하다. `/today`는 OAuth 없이 풀이 여부 미확인 추천을 제공하며 미해결 과제로 집계하지 않는다. 홈서버의 인터넷 연결과 DNS가 필요하다. OAuth를 보류하려면 `SOLVED_AC_REDIRECT_URI`를 비워두면 되고 이 모드에는 인바운드 포트가 필요 없다.
+배포 대상은 `/help`, `/setup`, `/settings`, `/skip`, `/resume`, `/curriculum`, `/today`, `/check` 명령이다. `/setup`과 `/today`에는 solved.ac 앱 인증값이 필요하다. 미연결 사용자는 풀이 미확인 추천을 받고, 연결 사용자는 새 추천에서 해결·상태 미확정 문제를 제외한다. 기존 당일 추천과 스킵 상태는 유지한다. `/check`로 현재 풀이 상태를 조회할 수 있다. 홈서버의 인터넷 연결과 DNS가 필요하다. OAuth를 보류하려면 `SOLVED_AC_REDIRECT_URI`를 비워두면 되고 이 모드에는 인바운드 포트가 필요 없다.
 
 ## 1. 소스 전송 및 빌드
 

@@ -9,6 +9,53 @@ use boj_discord_bot::{
 struct Source {
     offline: bool,
 }
+
+struct LinkedSource(Source);
+impl ProfileLookup for LinkedSource {
+    fn lookup(&self, handle: &str) -> Result<Profile, LookupError> {
+        self.0.lookup(handle)
+    }
+}
+impl RecommendationSource for LinkedSource {
+    fn verified_account_id(&self) -> Option<u64> {
+        Some(100)
+    }
+    fn validate_handle(&self, handle: &str) -> Result<(), String> {
+        if handle == "alice" {
+            Ok(())
+        } else {
+            Err("wrong account".into())
+        }
+    }
+    fn problems(&self, tier: u8, tags: &[&str], limit: usize) -> Result<Vec<Candidate>, String> {
+        self.0.problems(tier, tags, limit)
+    }
+}
+
+#[test]
+fn authenticated_mode_is_saved_and_old_files_and_pause_state_remain_compatible() {
+    let data = tempfile::tempdir().unwrap();
+    let source = LinkedSource(Source { offline: false });
+    let settings = SettingsStore::new(data.path());
+    settings.setup(1, "alice", 3, &source).unwrap();
+    let now = "2026-11-22T12:00:00Z".parse().unwrap();
+    let store = RecommendationStore::new(data.path());
+    let result = store.today(1, now, &settings, &source).unwrap();
+    assert_eq!(result.verified_account_id, Some(100));
+    assert_eq!(store.existing(1, now).unwrap().unwrap(), result);
+    let path = data.path().join("users/1/recommendations/2026-11-22.json");
+    let mut legacy = serde_json::to_value(&result).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("verified_account_id");
+    std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let old = store.existing(1, now).unwrap().unwrap();
+    assert_eq!(old.verified_account_id, None);
+    assert_eq!(old.problems, result.problems);
+    PauseStore::new(data.path()).skip(1, now, Some(1)).unwrap();
+    assert!(store.existing(1, now).unwrap_err().contains("정지"));
+}
 impl ProfileLookup for Source {
     fn lookup(&self, handle: &str) -> Result<Profile, LookupError> {
         if self.offline {

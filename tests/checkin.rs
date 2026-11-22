@@ -27,6 +27,7 @@ fn seed(data: &Path, user: u64, date: &str) {
     let directory = data.join(format!("users/{user}/recommendations"));
     fs::create_dir_all(&directory).unwrap();
     let recommendation = Recommendation {
+        verified_account_id: None,
         handle: "alice".into(),
         tier: 10,
         requested: 3,
