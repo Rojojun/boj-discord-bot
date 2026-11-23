@@ -228,10 +228,16 @@ impl SolvedAc {
 }
 
 fn parse_solve_status(body: &serde_json::Value) -> Option<bool> {
-    match body.get("userStatus").and_then(serde_json::Value::as_str) {
-        Some("solved") => Some(true),
-        Some("partial" | "tried") => Some(false),
-        // Null, missing and unknown values never prove that a problem is unsolved.
+    // Only used for user-authenticated responses after solves-scope validation.
+    // The live response returns an explicit null for no recorded solve status.
+    // Absence of the field is different: never infer a status from missing data.
+    match body.get("userStatus") {
+        Some(serde_json::Value::Null) => Some(false),
+        Some(serde_json::Value::String(status)) => match status.as_str() {
+            "solved" => Some(true),
+            "partial" | "tried" => Some(false),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -577,9 +583,26 @@ mod tests {
                 .iter()
                 .map(|p| p.problem.id.as_str())
                 .collect::<Vec<_>>(),
-            ["2", "4"]
+            ["2", "3"]
         );
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 4);
+    }
+
+    #[test]
+    fn observed_authenticated_null_statuses_can_fill_a_daily_recommendation() {
+        let list = serde_json::json!({"pageSize":50,"problems":(1000..=1004).map(|id|serde_json::json!({"problemId":id,"level":10,"title":format!("p{id}"),"tags":[]})).collect::<Vec<_>>()});
+        let result=recommend_from_mode(10,&[],3,true,|url| {
+            if url.path()=="/api/v4/problems" {return Ok(list.clone())}
+            let id=url.path().rsplit('/').next().unwrap().parse::<u64>().unwrap();
+            Ok(serde_json::json!({"userStatus":if id<=1001 {serde_json::json!("solved")} else {serde_json::Value::Null},"ojLinks":[{"url":format!("https://www.acmicpc.net/problem/{id}")}]}))
+        }).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|candidate| candidate.problem.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1002", "1003", "1004"]
+        );
     }
 
     #[test]
@@ -589,9 +612,7 @@ mod tests {
             if url.path() == "/api/v4/problems" {
                 Ok(list.clone())
             } else {
-                Ok(
-                    serde_json::json!({"userStatus":null,"ojLinks":[{"url":"https://judge.example/1"}]}),
-                )
+                Ok(serde_json::json!({"ojLinks":[{"url":"https://judge.example/1"}]}))
             }
         });
         assert!(result.unwrap_err().contains("상태 미확정 1개"));
@@ -626,9 +647,12 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(
+            parse_solve_status(&serde_json::json!({"userStatus":null})),
+            Some(false)
+        );
         for body in [
             serde_json::json!({}),
-            serde_json::json!({"userStatus":null}),
             serde_json::json!({"userStatus":{"solved":true}}),
         ] {
             assert_eq!(parse_solve_status(&body), None);
